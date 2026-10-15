@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Example script: production-style SPLADE sparse-encoder training on GooAQ.
+# Behavior: trains a SparseEncoder from distilbert-base-uncased (masked-LM head) with
+# SparseMultipleNegativesRankingLoss inside SpladeLoss (FLOPS regularisation, query weight 5e-5,
+# document weight 3e-5), evaluates on SparseNanoBEIR (msmarco, nfcorpus, nq), keeps the best
+# checkpoint, logs a VERDICT with active-dimension counts, saves and pushes.
+# CLI arguments: --eval-only PATH (optional) loads a saved sparse model and runs the evaluator.
+# Env vars: SMOKE_TEST=1 uses 50 train / 20 eval rows, one step, no Trackio/Hub.
+# Constants: MODEL_NAME, DATASET_NAME, TRAIN_SIZE (100,000), EVAL_SIZE (1,000), OUTPUT_DIR,
+# RUN_NAME, regulariser weights, SMOKE_TEST.
+# Top-level executed code: reads SMOKE_TEST at import; runs main() when executed as a script.
+# Side effects: downloads models/datasets, writes logs/ and models/, pushes to the Hub.
+# KNOWN ISSUE: training arguments hard-code bf16 mode while autocast_ctx falls back to fp16;
+# on GPUs without bfloat16 support (or CPU-only machines) training will fail to start.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -54,6 +67,14 @@ from sentence_transformers.sparse_encoder.losses import (
 
 
 def autocast_ctx():
+    # [FUNCTION DOC] HELPER: Build a mixed-precision autocast context for evaluator calls run
+    # outside the trainer.
+    # Behavior: if no CUDA GPU is available, return a no-op context manager. Otherwise pick bfloat16
+    # when the GPU supports it, else float16, and return a CUDA autocast context with that dtype.
+    # Inputs: none.
+    # Outputs: a context manager (no-op or CUDA autocast).
+    # Exceptions: none.
+    # Side effects: none until the context is entered (then CUDA ops run in reduced precision).
     """bf16/fp16 autocast for evaluator calls outside the trainer (which has its own autocast)."""
     if not torch.cuda.is_available():
         return nullcontext()
@@ -62,6 +83,14 @@ def autocast_ctx():
 
 
 def log_trackio_dashboard():
+    # [FUNCTION DOC] HELPER: Log the URL of the user's Trackio dashboard Space.
+    # Behavior: lazily imports the Hub client, asks the Hub who the logged-in user is, and if a
+    # username is returned logs an info line with https://huggingface.co/spaces/<user>/trackio.
+    # Inputs: none.
+    # Outputs: none (one info log line on success).
+    # Exceptions: every exception (no token, network failure, missing package) is caught and
+    # silently swallowed.
+    # Side effects: network call to the Hugging Face Hub; logging.
     """Surface the Trackio dashboard URL so the user can watch training live."""
     try:
         from huggingface_hub import whoami
@@ -88,6 +117,16 @@ SMOKE_TEST = os.environ.get("SMOKE_TEST") == "1"
 
 
 def setup_logging():
+    # [FUNCTION DOC] HELPER: Configure root logging and matmul precision for the run.
+    # Behavior: creates a "logs" directory in the working directory if missing, (re)configures root
+    # logging at INFO with a timestamped format writing both to the console and to
+    # logs/<RUN_NAME>.log (forcing replacement of existing handlers), raises the level of noisy
+    # HTTP/Hub/file-lock loggers to WARNING, and if CUDA is available sets float32 matmul precision
+    # to "high" (enables TF32 on Ampere+ GPUs).
+    # Inputs: none (uses the module-level RUN_NAME constant).
+    # Outputs: none.
+    # Exceptions: none caught; filesystem errors creating the directory or log file propagate.
+    # Side effects: creates a directory and log file, mutates global logging and torch state.
     """Configure logging + TF32. Tees to logs/{RUN_NAME}.log and silences HTTP spam."""
     os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
@@ -104,6 +143,27 @@ def setup_logging():
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point: train the SPLADE model and report the result.
+    # Behavior: parse the command line (unknown arguments are silently ignored), set up logging. If
+    # --eval-only PATH is given, load that saved model, build a SparseNanoBEIR evaluator (msmarco, nfcorpus, nq), run it once
+    # under autocast and return without training.
+    # Otherwise: load the base model as a SparseEncoder with model-card data, load the full GooAQ
+    # train split, split off EVAL_SIZE (or 20) eval rows with seed 12, cap training at TRAIN_SIZE
+    # (or 50), build SpladeLoss around sparse MNRL, record the baseline, and train 1 epoch (batch
+    # 32, lr 2e-5, linear schedule, no-duplicates). The final log line also reports query and
+    # corpus active dimensions found by suffix-matching the result keys ("n/a" if absent).
+    # Then: build the trainer, log the Trackio URL unless smoke-testing, train, re-run the evaluator
+    # under autocast, compute delta = score - baseline and log a VERDICT line: WIN if delta is at
+    # least 0.005, MARGINAL if non-negative, otherwise REGRESSION.
+    # Finally save the model to <output dir>/final; in smoke-test mode stop there, otherwise push
+    # the model to the Hub under the RUN_NAME repository and log its URL.
+    # Inputs: none (reads the command line and the SMOKE_TEST environment variable).
+    # Outputs: log lines (baseline/final metrics, VERDICT), saved model directory, checkpoints in the
+    # output directory, optional Hub repository. Returns nothing.
+    # Exceptions: any failure during the Hub push is caught and logged with a traceback (not
+    # re-raised); all other errors propagate.
+    # Side effects: network downloads of models/datasets, GPU use, files under the output directory
+    # and logs/, Trackio reporting (unless smoke test), Hub upload (unless smoke test).
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--eval-only", type=str, default=None, help="Skip training; load this saved model and run only the evaluator."

@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Example script: make an English bi-encoder multilingual via teacher-student
+# distillation on parallel sentences (MSELoss on teacher embeddings).
+# Behavior: an English teacher (all-mpnet-base-v2) embeds the English side of en-X parallel pairs;
+# a multilingual student (xlm-roberta-base) is trained so both the English sentence and its
+# translation regress onto that teacher embedding. Evaluates per language with MSE and
+# translation-accuracy evaluators, logs a before/after VERDICT, saves and pushes the model.
+# CLI arguments: --eval-only PATH (optional) loads a saved student and only runs the evaluator.
+# Env vars: SMOKE_TEST=1 trims each language subset to 50 train / 20 eval rows, runs a single
+# step, disables Trackio reporting and skips the Hub push.
+# Constants: teacher/student model names, parallel dataset name, source language "en", target
+# languages de/es/fr/it, at most 200,000 train and 1,000 eval sentences per language, student
+# max sequence length 128, output directory and run name, teacher encode batch size 256,
+# train batch size 64.
+# Top-level executed code: reads SMOKE_TEST at import; runs main() when executed as a script.
+# Side effects: downloads models and datasets, writes logs/, models/ output, pushes to the Hub.
+# KNOWN ISSUE: training arguments hard-code bf16 mode while autocast_ctx falls back to fp16;
+# on GPUs without bfloat16 support (or CPU-only machines) training will fail to start.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -62,6 +79,14 @@ from sentence_transformers.sentence_transformer.modules import Normalize
 
 
 def autocast_ctx():
+    # [FUNCTION DOC] HELPER: Build a mixed-precision autocast context for evaluator calls run
+    # outside the trainer.
+    # Behavior: if no CUDA GPU is available, return a no-op context manager. Otherwise pick bfloat16
+    # when the GPU supports it, else float16, and return a CUDA autocast context with that dtype.
+    # Inputs: none.
+    # Outputs: a context manager (no-op or CUDA autocast).
+    # Exceptions: none.
+    # Side effects: none until the context is entered (then CUDA ops run in reduced precision).
     """bf16/fp16 autocast for evaluator calls outside the trainer (which has its own autocast)."""
     if not torch.cuda.is_available():
         return nullcontext()
@@ -70,6 +95,14 @@ def autocast_ctx():
 
 
 def log_trackio_dashboard():
+    # [FUNCTION DOC] HELPER: Log the URL of the user's Trackio dashboard Space.
+    # Behavior: lazily imports the Hub client, asks the Hub who the logged-in user is, and if a
+    # username is returned logs an info line with https://huggingface.co/spaces/<user>/trackio.
+    # Inputs: none.
+    # Outputs: none (one info log line on success).
+    # Exceptions: every exception (no token, network failure, missing package) is caught and
+    # silently swallowed.
+    # Side effects: network call to the Hugging Face Hub; logging.
     """Surface the Trackio dashboard URL so the user can watch training live."""
     try:
         from huggingface_hub import whoami
@@ -103,6 +136,16 @@ SMOKE_TEST = os.environ.get("SMOKE_TEST") == "1"
 
 
 def setup_logging():
+    # [FUNCTION DOC] HELPER: Configure root logging and matmul precision for the run.
+    # Behavior: creates a "logs" directory in the working directory if missing, (re)configures root
+    # logging at INFO with a timestamped format writing both to the console and to
+    # logs/<RUN_NAME>.log (forcing replacement of existing handlers), raises the level of noisy
+    # HTTP/Hub/file-lock loggers to WARNING, and if CUDA is available sets float32 matmul precision
+    # to "high" (enables TF32 on Ampere+ GPUs).
+    # Inputs: none (uses the module-level RUN_NAME constant).
+    # Outputs: none.
+    # Exceptions: none caught; filesystem errors creating the directory or log file propagate.
+    # Side effects: creates a directory and log file, mutates global logging and torch state.
     """Configure logging + TF32. Tees to logs/{RUN_NAME}.log and silences HTTP spam."""
     os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
@@ -119,6 +162,20 @@ def setup_logging():
 
 
 def load_parallel_data() -> tuple[DatasetDict, DatasetDict]:
+    # [FUNCTION DOC] Load per-language parallel train and eval splits.
+    # Behavior: for each target language builds the subset name "<source>-<target>" and loads its
+    # train split; if loading fails, logs an error and skips that language. Truncates train to
+    # the first MAX_SENTENCES_PER_LANGUAGE rows. Tries to take the first EVAL_SENTENCES_PER_LANGUAGE
+    # rows of the "dev" split; if that fails for any reason, carves an eval set of that size off the
+    # train split with a seeded (12) shuffled split. Stores both under the subset name.
+    # Inputs: none (uses module constants).
+    # Outputs: a pair (train dataset dictionary, eval dataset dictionary) keyed by subset name, each
+    # dataset having "english" and "non_english" columns.
+    # Exceptions: load errors per language are caught and logged; dev-split errors are caught and
+    # swallowed (fallback); raises SystemExit with a message if no language loaded at all.
+    # Side effects: network/cache dataset downloads; logging.
+    # KNOWN ISSUE: the dev-split fallback catches every exception, so a dev split with fewer than
+    # 1,000 rows silently triggers the train-split fallback instead of using the dev data.
     """Load (en, target_lang) parallel pairs for each target language as a DatasetDict."""
     train_dict = DatasetDict()
     eval_dict = DatasetDict()
@@ -146,6 +203,16 @@ def load_parallel_data() -> tuple[DatasetDict, DatasetDict]:
 
 
 def build_evaluator(eval_dict: DatasetDict, teacher: SentenceTransformer) -> SequentialEvaluator:
+    # [FUNCTION DOC] Build a sequential evaluator of per-language MSE and translation accuracy.
+    # Behavior: for each subset appends an MSE evaluator (student embeddings of non-English vs.
+    # teacher embeddings of English) followed by a translation evaluator (cross-lingual nearest
+    # neighbour accuracy), both named after the subset. Wraps them in a sequential evaluator whose
+    # main score is the mean of every second sub-score (the translation accuracies only).
+    # Inputs: eval_dict - dataset dictionary of subsets with "english"/"non_english" columns;
+    # teacher - the teacher sentence-transformer model used for MSE targets.
+    # Outputs: the sequential evaluator.
+    # Exceptions: none.
+    # Side effects: none at construction (the MSE evaluator may encode with the teacher).
     """Per-language MSE + TranslationEvaluator. `main_score_function` averages
     translation accuracies only. MSE (`negative_mse * 100`) is on a different
     scale and would break the verdict threshold if mixed in."""
@@ -173,6 +240,29 @@ def build_evaluator(eval_dict: DatasetDict, teacher: SentenceTransformer) -> Seq
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point: train the multilingual student and report the result.
+    # Behavior: parse the command line (unknown arguments are silently ignored), set up logging. If
+    # --eval-only PATH is given, load that saved model, build the teacher, the parallel eval data and the evaluator, run it once
+    # under autocast and return without training.
+    # Otherwise: load teacher and student (with model-card metadata), set the student max sequence
+    # length, append a Normalize module to the student if the teacher has one and the student does
+    # not, and exit with SystemExit if the embedding dimensions differ. Load parallel data (trim in
+    # smoke-test mode), replace each split's columns with english, non_english and a "label"
+    # column holding teacher embeddings of the English text (batched mapping). Build MSELoss and
+    # the evaluator, record the baseline sequential score, set training arguments (3 epochs, lr
+    # 2e-5, best model by eval_sequential_score, eval/save every 10%).
+    # Then: build the trainer, log the Trackio URL unless smoke-testing, train, re-run the evaluator
+    # under autocast, compute delta = score - baseline and log a VERDICT line: WIN if delta is at
+    # least 0.005, MARGINAL if non-negative, otherwise REGRESSION.
+    # Finally save the model to <output dir>/final; in smoke-test mode stop there, otherwise push
+    # the model to the Hub under the RUN_NAME repository and log its URL.
+    # Inputs: none (reads the command line and the SMOKE_TEST environment variable).
+    # Outputs: log lines (baseline/final metrics, VERDICT), saved model directory, checkpoints in the
+    # output directory, optional Hub repository. Returns nothing.
+    # Exceptions: any failure during the Hub push is caught and logged with a traceback (not
+    # re-raised); all other errors propagate.
+    # Side effects: network downloads of models/datasets, GPU use, files under the output directory
+    # and logs/, Trackio reporting (unless smoke test), Hub upload (unless smoke test).
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--eval-only", type=str, default=None, help="Skip training; load this saved model and run only the evaluator."
@@ -225,6 +315,13 @@ def main() -> None:
         eval_dict = DatasetDict({k: v.select(range(min(20, len(v)))) for k, v in eval_dict.items()})
 
     def attach_teacher_label(batch):
+        # [FUNCTION DOC] HELPER: Batched map function adding teacher embeddings as regression labels.
+        # Behavior: encodes the batch's English sentences with the enclosing teacher model (batch size
+        # TEACHER_ENCODE_BATCH_SIZE, no progress bar) and returns english, non_english and label.
+        # Inputs: batch - a mapping of column name to list of values with "english" and "non_english".
+        # Outputs: a mapping with the two text columns unchanged plus "label" (an array of embeddings).
+        # Exceptions: none caught.
+        # Side effects: model inference on the teacher (GPU/CPU).
         return {
             "english": batch["english"],
             "non_english": batch["non_english"],

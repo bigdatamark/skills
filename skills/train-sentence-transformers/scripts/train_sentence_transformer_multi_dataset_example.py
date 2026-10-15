@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Example script: multi-dataset / multi-task bi-encoder training on AllNLI + STS-B.
+# Behavior: trains microsoft/mpnet-base on two named datasets at once, with a per-dataset loss
+# mapping (MultipleNegativesRankingLoss for AllNLI triplets, CoSENTLoss for STS-B scored pairs),
+# selects the best checkpoint by STS-B dev cosine similarity, logs a VERDICT, saves and pushes.
+# CLI arguments: --eval-only PATH (optional) loads a saved model and runs only NanoBEIR.
+# Env vars: SMOKE_TEST=1 trims both datasets (50 train / 20 eval), one step, no Trackio/Hub.
+# Constants: RUN_NAME ("mpnet-nli-stsb"), SMOKE_TEST. Output directory is hard-coded inline.
+# Top-level executed code: reads SMOKE_TEST at import; runs main() when executed as a script.
+# Side effects: downloads models and datasets, writes logs/ and models/, pushes to the Hub.
+# KNOWN ISSUE: training arguments hard-code bf16 mode while autocast_ctx falls back to fp16;
+# on GPUs without bfloat16 support (or CPU-only machines) training will fail to start.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -96,6 +107,14 @@ from sentence_transformers.util.similarity import SimilarityFunction
 
 
 def autocast_ctx():
+    # [FUNCTION DOC] HELPER: Build a mixed-precision autocast context for evaluator calls run
+    # outside the trainer.
+    # Behavior: if no CUDA GPU is available, return a no-op context manager. Otherwise pick bfloat16
+    # when the GPU supports it, else float16, and return a CUDA autocast context with that dtype.
+    # Inputs: none.
+    # Outputs: a context manager (no-op or CUDA autocast).
+    # Exceptions: none.
+    # Side effects: none until the context is entered (then CUDA ops run in reduced precision).
     """bf16/fp16 autocast for evaluator calls outside the trainer (which has its own autocast)."""
     if not torch.cuda.is_available():
         return nullcontext()
@@ -104,6 +123,14 @@ def autocast_ctx():
 
 
 def log_trackio_dashboard():
+    # [FUNCTION DOC] HELPER: Log the URL of the user's Trackio dashboard Space.
+    # Behavior: lazily imports the Hub client, asks the Hub who the logged-in user is, and if a
+    # username is returned logs an info line with https://huggingface.co/spaces/<user>/trackio.
+    # Inputs: none.
+    # Outputs: none (one info log line on success).
+    # Exceptions: every exception (no token, network failure, missing package) is caught and
+    # silently swallowed.
+    # Side effects: network call to the Hugging Face Hub; logging.
     """Surface the Trackio dashboard URL so the user can watch training live."""
     try:
         from huggingface_hub import whoami
@@ -122,6 +149,16 @@ SMOKE_TEST = os.environ.get("SMOKE_TEST") == "1"
 
 
 def setup_logging():
+    # [FUNCTION DOC] HELPER: Configure root logging and matmul precision for the run.
+    # Behavior: creates a "logs" directory in the working directory if missing, (re)configures root
+    # logging at INFO with a timestamped format writing both to the console and to
+    # logs/<RUN_NAME>.log (forcing replacement of existing handlers), raises the level of noisy
+    # HTTP/Hub/file-lock loggers to WARNING, and if CUDA is available sets float32 matmul precision
+    # to "high" (enables TF32 on Ampere+ GPUs).
+    # Inputs: none (uses the module-level RUN_NAME constant).
+    # Outputs: none.
+    # Exceptions: none caught; filesystem errors creating the directory or log file propagate.
+    # Side effects: creates a directory and log file, mutates global logging and torch state.
     """Configure logging + TF32. Tees to logs/{RUN_NAME}.log and silences HTTP spam."""
     os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
@@ -138,6 +175,27 @@ def setup_logging():
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point: train on the two datasets and report the result.
+    # Behavior: parse the command line (unknown arguments are silently ignored), set up logging. If
+    # --eval-only PATH is given, load that saved model, build a default NanoBEIR evaluator, run it once
+    # under autocast and return without training.
+    # Otherwise: load mpnet-base, load AllNLI triplets (50,000 train / 500 dev, or smoke sizes) and
+    # STS-B train/validation (trimmed in smoke mode), put them in mappings keyed "all-nli" and
+    # "stsb" with a matching loss mapping, build an STS-B validation similarity evaluator, record
+    # the baseline, and train 1 epoch (batch 32, lr 2e-5, no-duplicates sampler, default
+    # proportional multi-dataset sampling) into models/mpnet-nli-stsb.
+    # Then: build the trainer, log the Trackio URL unless smoke-testing, train, re-run the evaluator
+    # under autocast, compute delta = score - baseline and log a VERDICT line: WIN if delta is at
+    # least 0.005, MARGINAL if non-negative, otherwise REGRESSION.
+    # Finally save the model to <output dir>/final; in smoke-test mode stop there, otherwise push
+    # the model to the Hub under the RUN_NAME repository and log its URL.
+    # Inputs: none (reads the command line and the SMOKE_TEST environment variable).
+    # Outputs: log lines (baseline/final metrics, VERDICT), saved model directory, checkpoints in the
+    # output directory, optional Hub repository. Returns nothing.
+    # Exceptions: any failure during the Hub push is caught and logged with a traceback (not
+    # re-raised); all other errors propagate.
+    # Side effects: network downloads of models/datasets, GPU use, files under the output directory
+    # and logs/, Trackio reporting (unless smoke test), Hub upload (unless smoke test).
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--eval-only", type=str, default=None, help="Skip training; load this saved model and run only the evaluator."
