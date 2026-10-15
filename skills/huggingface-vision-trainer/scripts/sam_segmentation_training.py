@@ -1,3 +1,19 @@
+# [MODULE DOC] Training script that fine-tunes SAM or SAM2 mask decoders on a Hub dataset of
+# images, binary masks and box or point prompts, using the Trainer API with a custom loss.
+# Behavior: parses model/data/training arguments (batch size default 4, epochs default 30), logs
+# in to the Hub, starts Trackio, loads the dataset, ensures train and eval splits exist,
+# truncates, picks SAM2 or SAM classes by whether the model id contains "sam2", optionally freezes
+# the vision and prompt encoders, wraps splits in a prompt-aware torch dataset, trains with a
+# Dice plus cross-entropy loss on 256x256 low-resolution masks, evaluates loss, and pushes to the
+# Hub or writes a model card. The comment block after this one is PEP 723 inline script metadata.
+# CLI arguments: fields of the data and model argument classes plus all standard Trainer training
+# arguments; a single argument ending in ".json" is read as a JSON argument file.
+# Env vars: HF_TOKEN, or as a fallback "hfjob", supplies the Hub token.
+# Constants: logger - module logger; seg_loss - a MONAI Dice plus cross-entropy loss with sigmoid
+# activation, squared predictions and mean reduction, shared by the loss function.
+# Top-level executed code: checks Transformers is at least 4.57.0.dev0 (raising if not), builds
+# seg_loss at import, and runs main when executed as a script.
+# Side effects: network (Hub, Trackio), filesystem writes in the output directory and caches.
 # /// script
 # dependencies = [
 #     "transformers>=5.2.0",
@@ -47,6 +63,13 @@ check_min_version("4.57.0.dev0")
 # ---------------------------------------------------------------------------
 
 class SAMSegmentationDataset(Dataset):
+    # [CLASS DOC] Torch dataset that turns HF dataset rows into SAM/SAM2 processor inputs.
+    # Behavior: on indexing, reads the image, extracts a box or point prompt, runs the processor,
+    # and attaches a binary float mask (from the first channel if 3-D) and the original image size.
+    # Inputs: see the constructor.
+    # Outputs: per-item mappings of processor tensors plus "labels" and "original_image_size".
+    # Exceptions: value error when no prompt source is available.
+    # Side effects: none beyond decoding images.
     """Wraps a HF dataset into the format expected by SAM/SAM2 processors.
 
     Each sample must contain an image, a binary mask, and a prompt (bbox or
@@ -57,6 +80,12 @@ class SAMSegmentationDataset(Dataset):
     def __init__(self, dataset, processor, prompt_type: str,
                  image_col: str, mask_col: str, prompt_col: str | None,
                  bbox_col: str | None, point_col: str | None):
+        # [FUNCTION DOC] HELPER: Store the wrapped dataset, processor and column configuration.
+        # Behavior: assigns all arguments to attributes.
+        # Inputs: dataset (HF dataset split); processor (SAM or SAM2 processor); prompt_type ("bbox"
+        # or "point"); image_col and mask_col (strings); prompt_col, bbox_col, point_col (strings or
+        # none) - JSON prompt column and dedicated box/point columns.
+        # Outputs: none. Exceptions: none. Side effects: none.
         self.dataset = dataset
         self.processor = processor
         self.prompt_type = prompt_type
@@ -67,9 +96,22 @@ class SAMSegmentationDataset(Dataset):
         self.point_col = point_col
 
     def __len__(self):
+        # [FUNCTION DOC] HELPER: Return the number of rows in the wrapped dataset.
+        # Inputs: none. Outputs: integer length. Exceptions: none. Side effects: none.
         return len(self.dataset)
 
     def _extract_prompt(self, item):
+        # [FUNCTION DOC] HELPER: Extract the prompt (box or point(s)) for one row.
+        # Behavior: if a prompt column is configured and present, parses it as JSON when it is a
+        # string and returns its "bbox" (else "box") value for box prompts, or its "point" (else
+        # "points") value for point prompts. Otherwise returns the dedicated box or point column
+        # value matching the prompt type.
+        # Inputs: item (mapping of one dataset row).
+        # Outputs: a box (4 numbers) or a point / list of points.
+        # Exceptions: value error if no prompt source applies; JSON decode errors propagate.
+        # Side effects: none.
+        # KNOWN ISSUE: when the prompt column exists but lacks the requested key, nothing is returned
+        # silently and the processor fails later with a less clear error.
         if self.prompt_col and self.prompt_col in item:
             raw = item[self.prompt_col]
             parsed = json.loads(raw) if isinstance(raw, str) else raw
@@ -84,6 +126,17 @@ class SAMSegmentationDataset(Dataset):
         raise ValueError("Could not extract prompt from sample")
 
     def __getitem__(self, idx):
+        # [FUNCTION DOC] HELPER: Build processor inputs and target mask for one dataset index.
+        # Behavior: reads the row, extracts the prompt, calls the processor with the image and either
+        # input_boxes (one box nested for a single image/object) or input_points (a single point is
+        # wrapped into a list of points first). Converts the mask to an array, keeps the first channel
+        # if it is 3-D, and stores mask greater than 0 as float32 "labels". Adds the original size as
+        # a height, width tensor.
+        # Inputs: idx (integer index).
+        # Outputs: processor output mapping (pixel_values, original_sizes, input_boxes or
+        # input_points, ...) plus "labels" and "original_image_size".
+        # Exceptions: propagates prompt extraction and processor errors.
+        # Side effects: decodes the image.
         item = self.dataset[idx]
         image = item[self.image_col]
         prompt = self._extract_prompt(item)
@@ -104,6 +157,14 @@ class SAMSegmentationDataset(Dataset):
 
 
 def collate_fn(batch):
+    # [FUNCTION DOC] HELPER: Collate per-item SAM inputs into one batch for the Trainer.
+    # Behavior: concatenates pixel values, stacks original sizes and original image sizes, resizes
+    # each mask to 256x256 with nearest-neighbor interpolation and concatenates them as integer
+    # tensors, sets multimask_output false, and concatenates input boxes, or input points and
+    # point labels when present (based on the first item).
+    # Inputs: batch (list of item mappings from the dataset wrapper).
+    # Outputs: a mapping of batched tensors ready to pass to the model.
+    # Exceptions: none deliberately. Side effects: none.
     pixel_values = torch.cat([item["pixel_values"] for item in batch], dim=0)
     original_sizes = torch.stack([item["original_sizes"] for item in batch])
     original_image_size = torch.stack([item["original_image_size"] for item in batch])
@@ -149,6 +210,13 @@ seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction="m
 
 
 def compute_loss(outputs, labels, num_items_in_batch=None):
+    # [FUNCTION DOC] HELPER: Custom loss passed to the Trainer (SAM models compute no loss).
+    # Behavior: removes the singleton prompt dimension from the predicted masks and applies the
+    # Dice plus cross-entropy loss against the float labels.
+    # Inputs: outputs (model output with pred_masks); labels (tensor of binary 256x256 masks);
+    # num_items_in_batch (ignored, default none).
+    # Outputs: scalar loss tensor.
+    # Exceptions: none deliberately. Side effects: none.
     predicted_masks = outputs.pred_masks.squeeze(1)
     return seg_loss(predicted_masks, labels.float())
 
@@ -159,6 +227,14 @@ def compute_loss(outputs, labels, num_items_in_batch=None):
 
 @dataclass
 class DataTrainingArguments:
+    # [CLASS DOC] Dataclass of data-related command-line arguments for the SAM script.
+    # Behavior: plain field container parsed by the Hugging Face argument parser.
+    # Inputs: dataset_name (default "merve/MicroMat-mini"); dataset_config_name (default none);
+    # train_val_split (default 0.1); max_train_samples, max_eval_samples (default none);
+    # image_column_name (default "image"); mask_column_name (default "mask"); prompt_column_name
+    # (default "prompt", empty string disables); bbox_column_name and point_column_name (default
+    # none); prompt_type (default "bbox", or "point").
+    # Outputs: none. Exceptions: none. Side effects: none.
     dataset_name: str = field(
         default="merve/MicroMat-mini",
         metadata={"help": "Hub dataset ID."},
@@ -207,6 +283,12 @@ class DataTrainingArguments:
 
 @dataclass
 class ModelArguments:
+    # [CLASS DOC] Dataclass of model-related command-line arguments for the SAM script.
+    # Behavior: plain field container parsed by the Hugging Face argument parser.
+    # Inputs: model_name_or_path (default "facebook/sam2.1-hiera-small"); cache_dir (default none);
+    # model_revision (default "main"); token (default none); trust_remote_code (default false);
+    # freeze_vision_encoder and freeze_prompt_encoder (default true).
+    # Outputs: none. Exceptions: none. Side effects: none.
     model_name_or_path: str = field(
         default="facebook/sam2.1-hiera-small",
         metadata={"help": "Pretrained SAM/SAM2 model identifier."},
@@ -230,6 +312,33 @@ class ModelArguments:
 # ---------------------------------------------------------------------------
 
 def main():
+    # [FUNCTION DOC] Entry point: run the SAM/SAM2 fine-tuning pipeline.
+    # Behavior:
+    #   1. Parse arguments with defaults per-device batch size 4 and 30 epochs (JSON file if it is the
+    #      only argument); log in with HF_TOKEN/"hfjob" or warn when pushing; start Trackio;
+    #      configure logging.
+    #   2. Load the dataset. Without a train split: if there is exactly one split, shuffle it and split
+    #      it into train/validation (fraction train_val_split, default 0.1), else raise a value error.
+    #      With train but neither validation nor test: shuffle and split off validation with the seed.
+    #   3. Truncate train and the eval split (validation, else test) to the max sample limits.
+    #   4. Load Sam2Processor/Sam2Model if the model id contains "sam2", else SamProcessor/SamModel.
+    #      Freeze parameters whose names start with vision_encoder / prompt_encoder as configured and
+    #      log trainable vs total parameter counts.
+    #   5. Wrap train and eval splits in the dataset wrapper; build a Trainer with the custom collator
+    #      and loss; train if requested (save model, metrics, state); evaluate if requested and an eval
+    #      split exists; finish Trackio; push to the Hub with tags or write a model card.
+    # Inputs: none directly (CLI arguments / JSON file and env vars).
+    # Outputs: model weights, metrics, trainer state and model card in the output directory;
+    # optionally a Hub repository.
+    # Exceptions: value error when no train split can be formed; other errors propagate.
+    # Side effects: Hub login, network access, Trackio logging, global logging config, file writes.
+    # KNOWN ISSUE: cache_dir, model_revision, token and trust_remote_code are ignored when loading
+    # the processor and model.
+    # KNOWN ISSUE: the processor is not given to the Trainer, so saved/pushed checkpoints lack the
+    # processor configuration needed to reload the model for inference.
+    # KNOWN ISSUE: the single-split train/validation split uses no seed, so it is not reproducible.
+    # KNOWN ISSUE: the collator passes "original_image_size" (and "original_sizes") to the model
+    # forward call; this relies on the model accepting extra keyword arguments.
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     parser.set_defaults(per_device_train_batch_size=4, num_train_epochs=30)
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
