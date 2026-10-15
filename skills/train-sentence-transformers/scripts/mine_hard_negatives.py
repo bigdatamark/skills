@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# [MODULE DOC] CLI wrapper that mines hard negatives for a pair dataset and saves/pushes it.
+# Loads a Hugging Face dataset of anchor/positive pairs, loads a bi-encoder retriever (and an
+# optional cross-encoder re-scorer), optionally loads a separate document corpus, calls the
+# library's hard-negative mining utility with the CLI options, then saves the result to disk
+# and/or pushes it to the Hub.
+# CLI arguments: see build_parser (dataset, model, mining window, filters, output format, corpus,
+# output path, Hub push options).
+# Env vars: none read directly; Hub credentials are used implicitly when pushing.
+# Top-level executed code: configures root logging at INFO with a timestamped format and lowers
+# noisy HTTP/hub/filesystem library loggers to WARNING; when run as a script, exits with the
+# return code of main.
+# Constants: none.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -81,6 +93,22 @@ for _noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3", "filelock", "f
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # [FUNCTION DOC] Build the argument parser for the mining CLI.
+    # Behavior: creates a parser whose description is the module docstring (raw formatting) and
+    # registers all options.
+    # Inputs: none.
+    # Outputs: the parser. Options: --dataset (required, Hub id or path); --subset (default none);
+    # --split (default "train"); --model (required, retriever); --cross-encoder (optional re-scorer);
+    # --anchor-column / --positive-column (default auto-detect); --num-negatives (integer, default 3);
+    # --range-min / --range-max (integers, default 0 and 100); --sampling-strategy ("top" or
+    # "random", default "top"); --max-score / --min-score / --absolute-margin / --relative-margin
+    # (floats, default none); --output-format ("triplet", "n-tuple", "labeled-pair", "labeled-list";
+    # default "triplet"); flags --include-positives, --output-scores, --use-faiss, --private;
+    # --batch-size (integer, default 32); --corpus-dataset (optional), --corpus-subset (optional),
+    # --corpus-split (default "train"), --corpus-column (default "text"); --output-path (optional
+    # local directory); --push-to-hub (optional repo id).
+    # Exceptions: none.
+    # Side effects: none.
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset", required=True)
     p.add_argument("--subset", default=None)
@@ -131,6 +159,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # [FUNCTION DOC] Run the mining pipeline end to end.
+    # Behavior: parses arguments; loads the input dataset split (with subset if given) and prints its
+    # row count; loads the retriever and, if requested, the cross-encoder; if a corpus dataset is
+    # given, loads it, checks the corpus column exists and collects that column as a list of texts;
+    # calls the mining utility forwarding every option; prints the mined row count and columns; saves
+    # to --output-path if given; pushes to the Hub if --push-to-hub is given (private if --private);
+    # prints a notice when neither output was requested.
+    # Inputs: none directly; reads command-line arguments.
+    # Outputs: returns 0; prints progress lines to stdout; writes a dataset directory and/or a Hub
+    # dataset repo.
+    # Exceptions: exits with a message (SystemExit) if the corpus column is missing; loading, mining
+    # and push errors propagate.
+    # Side effects: network downloads, model inference (GPU if available), filesystem writes, Hub
+    # upload.
+    # KNOWN ISSUE: when neither --output-path nor --push-to-hub is given, all mining work is discarded
+    # yet the exit code is still 0.
     args = build_parser().parse_args()
 
     dataset = (

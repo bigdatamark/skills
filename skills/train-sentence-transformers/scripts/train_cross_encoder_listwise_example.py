@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Example: train a listwise CrossEncoder reranker with LambdaLoss on mined GooAQ lists.
+# Splits GooAQ pairs into train/eval, mines labeled candidate lists (1 positive + NUM_NEGATIVES
+# negatives) for training and deeper n-tuples for an in-domain reranking eval, trains ModernBERT
+# (identity activation, max length 512) with LambdaLoss, evaluates in-domain plus NanoBEIR,
+# early-stops on the in-domain metric, logs a verdict and optionally pushes to the Hub.
+# Constants: MODEL_NAME, DATASET_NAME, RETRIEVER_NAME, TRAIN_SIZE 100000 (total pairs loaded),
+# EVAL_SIZE 1000, NUM_NEGATIVES 7, EVAL_RERANK_DEPTH 30, OUTPUT_DIR, RUN_NAME, HARD_NEG_CACHE and
+# HARD_EVAL_CACHE (mined dataset directories), SMOKE_TEST flag.
+# Env vars: SMOKE_TEST - when exactly "1", trims data, runs a single optimizer step, disables
+# Trackio reporting and skips the Hub push. Hub credentials (e.g. HF_TOKEN) are used implicitly.
+# CLI arguments: --eval-only PATH - skip training, load the saved model at PATH and run only the
+# evaluator. Unknown arguments are silently ignored (so launchers can pass extra flags).
+# Top-level executed code: imports and constant definitions only; main() runs when executed as a
+# script.
+# Outputs: logs to console and logs/<RUN_NAME>.log; checkpoints under OUTPUT_DIR; final model in
+# OUTPUT_DIR/final; on non-smoke runs a public Hub repo named RUN_NAME under the logged-in user.
+# Also writes both mined dataset caches.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -71,6 +88,13 @@ from sentence_transformers.util import mine_hard_negatives
 
 
 def autocast_ctx():
+    # [FUNCTION DOC] HELPER: Build a mixed-precision autocast context for out-of-trainer evals.
+    # Behavior: if no CUDA device is available, returns a no-op context manager. Otherwise picks
+    # bfloat16 when the GPU supports it, else float16, and returns a CUDA autocast context for it.
+    # Inputs: none.
+    # Outputs: a context manager (no-op or CUDA autocast).
+    # Exceptions: none raised deliberately.
+    # Side effects: none (queries CUDA availability/capabilities only).
     """bf16/fp16 autocast for evaluator calls outside the trainer (which has its own autocast)."""
     if not torch.cuda.is_available():
         return nullcontext()
@@ -79,6 +103,14 @@ def autocast_ctx():
 
 
 def log_trackio_dashboard():
+    # [FUNCTION DOC] HELPER: Log the URL of the user's Trackio dashboard Space.
+    # Behavior: imports the Hugging Face Hub "whoami" call, fetches the authenticated user name and,
+    # if present, logs an info line pointing to https://huggingface.co/spaces/<user>/trackio.
+    # Inputs: none.
+    # Outputs: none (one log line on success).
+    # Exceptions: every exception (missing package, not logged in, network failure) is caught and
+    # silently ignored.
+    # Side effects: network call to the Hugging Face Hub; writes to the logging system.
     """Surface the Trackio dashboard URL so the user can watch training live."""
     try:
         from huggingface_hub import whoami
@@ -107,6 +139,16 @@ SMOKE_TEST = os.environ.get("SMOKE_TEST") == "1"
 
 
 def setup_logging():
+    # [FUNCTION DOC] HELPER: Configure logging for the run and enable TF32 matmuls on CUDA.
+    # Behavior: creates the "logs" directory if missing; forcibly reconfigures the root logger at INFO
+    # level with a timestamped format, writing both to the console and to logs/<RUN_NAME>.log; sets
+    # noisy HTTP/hub/filesystem library loggers to WARNING; if CUDA is available, sets float32 matmul
+    # precision to "high" (allows TF32).
+    # Inputs: none (uses the module constant RUN_NAME).
+    # Outputs: none.
+    # Exceptions: none caught; filesystem errors creating the directory or log file propagate.
+    # Side effects: creates a directory and log file; replaces global logging handlers; changes the
+    # global torch matmul precision setting.
     """Configure logging + TF32. Tees to logs/{RUN_NAME}.log and silences HTTP spam."""
     os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
@@ -123,6 +165,35 @@ def setup_logging():
 
 
 def main() -> None:
+    # [FUNCTION DOC] Train (or just evaluate) the LambdaLoss CrossEncoder reranker.
+    # Behavior: parses --eval-only (ignoring unknown args) and sets up logging. In eval-only mode loads
+    # the given CrossEncoder, runs NanoBEIR under autocast and returns. Otherwise builds a one-label
+    # CrossEncoder with identity activation and sets max sequence length to 512; loads TRAIN_SIZE
+    # pairs and splits off EVAL_SIZE (seed 12); loads both mined caches if both exist, else mines
+    # training lists (ranks 10-100, "top", labeled-list, FAISS, batch 4096) and eval n-tuples with
+    # EVAL_RERANK_DEPTH negatives against all loaded answers, caches both and frees the retriever;
+    # on smoke tests trims to 50 train / 20 eval rows; creates LambdaLoss (mini-batch 16); builds an
+    # in-domain reranking evaluator (query, the answer as positive, documents = answer plus every
+    # mined negative column) and a sequential evaluator with NanoBEIR; runs the baseline (primary
+    # metric = in-domain); configures training (1 epoch, max 1 step on smoke, batch 64, lr 2e-5,
+    # linear 10% warmup, bf16, eval/save every 10%, keep 2, best by in-domain metric, Trackio unless
+    # smoke, seed 12); trains without an eval dataset, with early stopping (patience 3).
+    # Post-training: re-runs the evaluator, computes delta versus baseline and logs a VERDICT line
+    # (WIN if delta is at least 0.005, MARGINAL if non-negative, else REGRESSION); saves the model
+    # to OUTPUT_DIR/final; unless smoke testing, pushes it to the Hub under RUN_NAME and logs the repo
+    # URL (commit URL with the commit part stripped).
+    # Inputs: none directly; reads the command line and the SMOKE_TEST env var.
+    # Outputs: none returned; logs, checkpoint and final model directories, optional Hub repo.
+    # Exceptions: any error during the Hub push is caught and logged with its traceback; all other
+    # errors (download, out-of-memory, missing bf16 support) propagate.
+    # Side effects: network downloads of models/datasets, GPU usage, filesystem writes, Hub upload,
+    # Trackio reporting (non-smoke).
+    # KNOWN ISSUE: bf16 training is hard-enabled, so training fails on CPU-only machines or GPUs without
+    # bfloat16 support, even though the eval autocast helper handles those cases.
+    # KNOWN ISSUE: smoke tests still load 100000 pairs and mine the full set before trimming, so a
+    # smoke run is slow on a cold cache, and the mined caches are shared with full runs.
+    # KNOWN ISSUE: the in-domain evaluator assumes the first two eval columns are question and answer
+    # and all remaining columns are negatives; a different column layout would be silently misread.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--eval-only", type=str, default=None, help="Skip training; load this saved model and run only the evaluator."

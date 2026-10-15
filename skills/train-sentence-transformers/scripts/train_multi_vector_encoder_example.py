@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Example: train a ColBERT-style multi-vector encoder with MaxSim MNRL on MS MARCO.
+# Trains ModernBERT (with a fresh token projection added by the multi-vector wrapper) on MS MARCO
+# BM25 triplets with multi-vector multiple-negatives ranking loss and no-duplicate batches; uses a
+# 3-dataset NanoBEIR evaluator during training and the full NanoBEIR suite for baseline and final
+# scores; logs a verdict and optionally pushes to the Hub.
+# Constants: MODEL_NAME, DATASET_NAME / DATASET_SUBSET ("triplet"), TRAIN_SIZE 50000, EVAL_SIZE
+# 1000, OUTPUT_DIR, RUN_NAME, SMOKE_TEST flag.
+# Env vars: SMOKE_TEST - when exactly "1", trims data, runs a single optimizer step, disables
+# Trackio reporting and skips the Hub push. Hub credentials (e.g. HF_TOKEN) are used implicitly.
+# CLI arguments: --eval-only PATH - skip training, load the saved model at PATH and run only the
+# evaluator. Unknown arguments are silently ignored (so launchers can pass extra flags).
+# Top-level executed code: imports and constant definitions only; main() runs when executed as a
+# script.
+# Outputs: logs to console and logs/<RUN_NAME>.log; checkpoints under OUTPUT_DIR; final model in
+# OUTPUT_DIR/final; on non-smoke runs a public Hub repo named RUN_NAME under the logged-in user.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -67,6 +82,13 @@ from sentence_transformers.multi_vector_encoder.losses import MultiVectorMultipl
 
 
 def autocast_ctx():
+    # [FUNCTION DOC] HELPER: Build a mixed-precision autocast context for out-of-trainer evals.
+    # Behavior: if no CUDA device is available, returns a no-op context manager. Otherwise picks
+    # bfloat16 when the GPU supports it, else float16, and returns a CUDA autocast context for it.
+    # Inputs: none.
+    # Outputs: a context manager (no-op or CUDA autocast).
+    # Exceptions: none raised deliberately.
+    # Side effects: none (queries CUDA availability/capabilities only).
     """bf16/fp16 autocast for evaluator calls outside the trainer (which has its own autocast)."""
     if not torch.cuda.is_available():
         return nullcontext()
@@ -75,6 +97,14 @@ def autocast_ctx():
 
 
 def log_trackio_dashboard():
+    # [FUNCTION DOC] HELPER: Log the URL of the user's Trackio dashboard Space.
+    # Behavior: imports the Hugging Face Hub "whoami" call, fetches the authenticated user name and,
+    # if present, logs an info line pointing to https://huggingface.co/spaces/<user>/trackio.
+    # Inputs: none.
+    # Outputs: none (one log line on success).
+    # Exceptions: every exception (missing package, not logged in, network failure) is caught and
+    # silently ignored.
+    # Side effects: network call to the Hugging Face Hub; writes to the logging system.
     """Surface the Trackio dashboard URL so the user can watch training live."""
     try:
         from huggingface_hub import whoami
@@ -100,6 +130,16 @@ SMOKE_TEST = os.environ.get("SMOKE_TEST") == "1"
 
 
 def setup_logging():
+    # [FUNCTION DOC] HELPER: Configure logging for the run and enable TF32 matmuls on CUDA.
+    # Behavior: creates the "logs" directory if missing; forcibly reconfigures the root logger at INFO
+    # level with a timestamped format, writing both to the console and to logs/<RUN_NAME>.log; sets
+    # noisy HTTP/hub/filesystem library loggers to WARNING; if CUDA is available, sets float32 matmul
+    # precision to "high" (allows TF32).
+    # Inputs: none (uses the module constant RUN_NAME).
+    # Outputs: none.
+    # Exceptions: none caught; filesystem errors creating the directory or log file propagate.
+    # Side effects: creates a directory and log file; replaces global logging handlers; changes the
+    # global torch matmul precision setting.
     """Configure logging + TF32. Tees to logs/{RUN_NAME}.log and silences HTTP spam."""
     os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
@@ -116,6 +156,29 @@ def setup_logging():
 
 
 def main() -> None:
+    # [FUNCTION DOC] Train (or just evaluate) the multi-vector encoder.
+    # Behavior: parses --eval-only (ignoring unknown args) and sets up logging. In eval-only mode loads
+    # the given multi-vector model, runs the full NanoBEIR evaluator (batch 16) under autocast and
+    # returns. Otherwise loads the base model in float32 with model card data; loads the first
+    # train+eval triplets (50+20 for smoke) and splits off the eval set (seed 12); creates the MNRL
+    # loss with default scale; builds a 3-dataset training evaluator (msmarco, nq, fiqa2018) and a
+    # full-suite test evaluator; runs the training evaluator once (to fix its metric name) and the
+    # test evaluator for the baseline; derives the "eval_"-prefixed metric key; configures training
+    # (1 epoch, max 1 step on smoke, batch 32, lr 3e-5, linear 5% warmup, bf16, no-duplicates
+    # sampler, eval/save every 10%, keep 2, best by metric, Trackio unless smoke, seed 12); trains.
+    # Post-training scoring uses the full-suite test evaluator.
+    # Post-training: re-runs the evaluator, computes delta versus baseline and logs a VERDICT line
+    # (WIN if delta is at least 0.005, MARGINAL if non-negative, else REGRESSION); saves the model
+    # to OUTPUT_DIR/final; unless smoke testing, pushes it to the Hub under RUN_NAME and logs the repo
+    # URL (commit URL with the commit part stripped).
+    # Inputs: none directly; reads the command line and the SMOKE_TEST env var.
+    # Outputs: none returned; logs, checkpoint and final model directories, optional Hub repo.
+    # Exceptions: any error during the Hub push is caught and logged with its traceback; all other
+    # errors (download, out-of-memory, missing bf16 support) propagate.
+    # Side effects: network downloads of models/datasets, GPU usage, filesystem writes, Hub upload,
+    # Trackio reporting (non-smoke).
+    # KNOWN ISSUE: bf16 training is hard-enabled, so training fails on CPU-only machines or GPUs without
+    # bfloat16 support, even though the eval autocast helper handles those cases.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--eval-only", type=str, default=None, help="Skip training, load this saved model and run only the evaluator."

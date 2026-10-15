@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Example: distill a small CrossEncoder reranker with MarginMSE on MS MARCO.
+# Trains MiniLM (single logit, identity activation) on precomputed teacher score margins for
+# (query, positive, negative) rows, evaluates with NanoBEIR reranking (msmarco, nfcorpus, nq),
+# keeps the best checkpoint, early-stops, logs a verdict and optionally pushes to the Hub.
+# Constants: MODEL_NAME (student base), DATASET_NAME / DATASET_SUBSET (MS MARCO margin-MSE
+# subset), TRAIN_SIZE 100000 and EVAL_SIZE 5000 rows, OUTPUT_DIR, RUN_NAME, DATA_CACHE (directory
+# holding the id-resolved text dataset), SMOKE_TEST flag.
+# Env vars: SMOKE_TEST - when exactly "1", trims data, runs a single optimizer step, disables
+# Trackio reporting and skips the Hub push. Hub credentials (e.g. HF_TOKEN) are used implicitly.
+# CLI arguments: --eval-only PATH - skip training, load the saved model at PATH and run only the
+# evaluator. Unknown arguments are silently ignored (so launchers can pass extra flags).
+# Top-level executed code: imports and constant definitions only; main() runs when executed as a
+# script.
+# Outputs: logs to console and logs/<RUN_NAME>.log; checkpoints under OUTPUT_DIR; final model in
+# OUTPUT_DIR/final; on non-smoke runs a public Hub repo named RUN_NAME under the logged-in user.
+# Also writes the resolved dataset cache to DATA_CACHE.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -63,6 +79,13 @@ from sentence_transformers.cross_encoder.losses import MarginMSELoss
 
 
 def autocast_ctx():
+    # [FUNCTION DOC] HELPER: Build a mixed-precision autocast context for out-of-trainer evals.
+    # Behavior: if no CUDA device is available, returns a no-op context manager. Otherwise picks
+    # bfloat16 when the GPU supports it, else float16, and returns a CUDA autocast context for it.
+    # Inputs: none.
+    # Outputs: a context manager (no-op or CUDA autocast).
+    # Exceptions: none raised deliberately.
+    # Side effects: none (queries CUDA availability/capabilities only).
     """bf16/fp16 autocast for evaluator calls outside the trainer (which has its own autocast)."""
     if not torch.cuda.is_available():
         return nullcontext()
@@ -71,6 +94,14 @@ def autocast_ctx():
 
 
 def log_trackio_dashboard():
+    # [FUNCTION DOC] HELPER: Log the URL of the user's Trackio dashboard Space.
+    # Behavior: imports the Hugging Face Hub "whoami" call, fetches the authenticated user name and,
+    # if present, logs an info line pointing to https://huggingface.co/spaces/<user>/trackio.
+    # Inputs: none.
+    # Outputs: none (one log line on success).
+    # Exceptions: every exception (missing package, not logged in, network failure) is caught and
+    # silently ignored.
+    # Side effects: network call to the Hugging Face Hub; writes to the logging system.
     """Surface the Trackio dashboard URL so the user can watch training live."""
     try:
         from huggingface_hub import whoami
@@ -96,6 +127,16 @@ SMOKE_TEST = os.environ.get("SMOKE_TEST") == "1"
 
 
 def setup_logging():
+    # [FUNCTION DOC] HELPER: Configure logging for the run and enable TF32 matmuls on CUDA.
+    # Behavior: creates the "logs" directory if missing; forcibly reconfigures the root logger at INFO
+    # level with a timestamped format, writing both to the console and to logs/<RUN_NAME>.log; sets
+    # noisy HTTP/hub/filesystem library loggers to WARNING; if CUDA is available, sets float32 matmul
+    # precision to "high" (allows TF32).
+    # Inputs: none (uses the module constant RUN_NAME).
+    # Outputs: none.
+    # Exceptions: none caught; filesystem errors creating the directory or log file propagate.
+    # Side effects: creates a directory and log file; replaces global logging handlers; changes the
+    # global torch matmul precision setting.
     """Configure logging + TF32. Tees to logs/{RUN_NAME}.log and silences HTTP spam."""
     os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
@@ -112,6 +153,17 @@ def setup_logging():
 
 
 def load_resolved_dataset():
+    # [FUNCTION DOC] HELPER: Load the MS MARCO margin rows with ids resolved to text, cached on disk.
+    # Behavior: if DATA_CACHE exists, loads and returns it. Otherwise loads the corpus and queries
+    # subsets, builds id-to-text lookups, takes the first TRAIN_SIZE + EVAL_SIZE rows of the margin
+    # subset, maps them in batches to query/positive/negative text plus the score, drops the id
+    # columns, saves the result to DATA_CACHE and returns it.
+    # Inputs: none (uses module constants).
+    # Outputs: a dataset with columns query, positive, negative, score.
+    # Exceptions: none caught; an unknown id raises a lookup error; download errors propagate.
+    # Side effects: network downloads; writes the cache directory; logs progress.
+    # KNOWN ISSUE: the cache is not keyed by size, so changing TRAIN_SIZE/EVAL_SIZE silently reuses a
+    # stale cache until DATA_CACHE is deleted.
     """Load (query, positive, negative, score) rows. The MSMARCO subset is keyed by
     passage_id / query_id. Resolve to text once and cache to disk so reruns skip the work."""
     if os.path.isdir(DATA_CACHE):
@@ -126,6 +178,13 @@ def load_resolved_dataset():
     raw = load_dataset(DATASET_NAME, DATASET_SUBSET, split="train").select(range(TRAIN_SIZE + EVAL_SIZE))
 
     def id_to_text(batch):
+        # [FUNCTION DOC] HELPER: Batched mapper converting query/passage ids to their texts.
+        # Behavior: looks up each query id in the query lookup and each positive/negative id in the
+        # corpus lookup (closed over from the enclosing function); passes scores through unchanged.
+        # Inputs: batch - a mapping of column name to list, with query_id, positive_id, negative_id, score.
+        # Outputs: a mapping with lists for query, positive, negative and score.
+        # Exceptions: a missing id raises a lookup error.
+        # Side effects: none.
         return {
             "query": [queries[qid] for qid in batch["query_id"]],
             "positive": [corpus[pid] for pid in batch["positive_id"]],
@@ -139,6 +198,29 @@ def load_resolved_dataset():
 
 
 def main() -> None:
+    # [FUNCTION DOC] Train (or just evaluate) the distilled CrossEncoder reranker.
+    # Behavior: parses --eval-only (ignoring unknown args) and sets up logging. In eval-only mode loads
+    # the given CrossEncoder, runs the NanoBEIR reranking evaluator under autocast and returns.
+    # Otherwise builds the student CrossEncoder with one label and an identity activation plus model
+    # card data; loads the resolved dataset (trimmed to 70 rows for smoke tests); splits off an eval
+    # set (20 rows for smoke, else EVAL_SIZE, seed 12); creates MarginMSE loss and the NanoBEIR
+    # evaluator; runs a baseline evaluation (which also prefixes the primary metric name) and derives
+    # the "eval_"-prefixed metric key; configures training args (1 epoch, max 1 step on smoke,
+    # batch 32, lr 8e-6, linear schedule with 10% warmup, bf16, eval/save every 10% of steps, keep 2
+    # checkpoints, best model by the metric, Trackio unless smoke, seed 12); trains with early
+    # stopping (patience 3).
+    # Post-training: re-runs the evaluator, computes delta versus baseline and logs a VERDICT line
+    # (WIN if delta is at least 0.005, MARGINAL if non-negative, else REGRESSION); saves the model
+    # to OUTPUT_DIR/final; unless smoke testing, pushes it to the Hub under RUN_NAME and logs the repo
+    # URL (commit URL with the commit part stripped).
+    # Inputs: none directly; reads the command line and the SMOKE_TEST env var.
+    # Outputs: none returned; logs, checkpoint and final model directories, optional Hub repo.
+    # Exceptions: any error during the Hub push is caught and logged with its traceback; all other
+    # errors (download, out-of-memory, missing bf16 support) propagate.
+    # Side effects: network downloads of models/datasets, GPU usage, filesystem writes, Hub upload,
+    # Trackio reporting (non-smoke).
+    # KNOWN ISSUE: bf16 training is hard-enabled, so training fails on CPU-only machines or GPUs without
+    # bfloat16 support, even though the eval autocast helper handles those cases.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--eval-only", type=str, default=None, help="Skip training; load this saved model and run only the evaluator."

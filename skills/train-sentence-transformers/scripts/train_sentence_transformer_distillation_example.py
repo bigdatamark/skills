@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Example: distill a SentenceTransformer student from a teacher via embedding MSE.
+# Collects unique sentences from AllNLI pairs, encodes them with the teacher (all-mpnet-base-v2),
+# and trains a DistilBERT student to regress those embeddings with MSE; adds a Normalize module to
+# the student if the teacher has one; tracks STS-B validation cosine correlation; logs a verdict
+# and optionally pushes to the Hub.
+# Constants: TEACHER_MODEL_NAME, STUDENT_MODEL_NAME, CORPUS_DATASET / CORPUS_SUBSET, TRAIN_SIZE
+# 50000, EVAL_SIZE 1000 sentences, OUTPUT_DIR, RUN_NAME, TEACHER_ENCODE_BATCH_SIZE 256,
+# TRAIN_BATCH_SIZE 128, SMOKE_TEST flag.
+# Env vars: SMOKE_TEST - when exactly "1", trims data, runs a single optimizer step, disables
+# Trackio reporting and skips the Hub push. Hub credentials (e.g. HF_TOKEN) are used implicitly.
+# CLI arguments: --eval-only PATH - skip training, load the saved model at PATH and run only the
+# evaluator. Unknown arguments are silently ignored (so launchers can pass extra flags).
+# Top-level executed code: imports and constant definitions only; main() runs when executed as a
+# script.
+# Outputs: logs to console and logs/<RUN_NAME>.log; checkpoints under OUTPUT_DIR; final model in
+# OUTPUT_DIR/final; on non-smoke runs a public Hub repo named RUN_NAME under the logged-in user.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -92,6 +108,13 @@ from sentence_transformers.util.similarity import SimilarityFunction
 
 
 def autocast_ctx():
+    # [FUNCTION DOC] HELPER: Build a mixed-precision autocast context for out-of-trainer evals.
+    # Behavior: if no CUDA device is available, returns a no-op context manager. Otherwise picks
+    # bfloat16 when the GPU supports it, else float16, and returns a CUDA autocast context for it.
+    # Inputs: none.
+    # Outputs: a context manager (no-op or CUDA autocast).
+    # Exceptions: none raised deliberately.
+    # Side effects: none (queries CUDA availability/capabilities only).
     """bf16/fp16 autocast for evaluator calls outside the trainer (which has its own autocast)."""
     if not torch.cuda.is_available():
         return nullcontext()
@@ -100,6 +123,14 @@ def autocast_ctx():
 
 
 def log_trackio_dashboard():
+    # [FUNCTION DOC] HELPER: Log the URL of the user's Trackio dashboard Space.
+    # Behavior: imports the Hugging Face Hub "whoami" call, fetches the authenticated user name and,
+    # if present, logs an info line pointing to https://huggingface.co/spaces/<user>/trackio.
+    # Inputs: none.
+    # Outputs: none (one log line on success).
+    # Exceptions: every exception (missing package, not logged in, network failure) is caught and
+    # silently ignored.
+    # Side effects: network call to the Hugging Face Hub; writes to the logging system.
     """Surface the Trackio dashboard URL so the user can watch training live."""
     try:
         from huggingface_hub import whoami
@@ -130,6 +161,16 @@ SMOKE_TEST = os.environ.get("SMOKE_TEST") == "1"
 
 
 def setup_logging():
+    # [FUNCTION DOC] HELPER: Configure logging for the run and enable TF32 matmuls on CUDA.
+    # Behavior: creates the "logs" directory if missing; forcibly reconfigures the root logger at INFO
+    # level with a timestamped format, writing both to the console and to logs/<RUN_NAME>.log; sets
+    # noisy HTTP/hub/filesystem library loggers to WARNING; if CUDA is available, sets float32 matmul
+    # precision to "high" (allows TF32).
+    # Inputs: none (uses the module constant RUN_NAME).
+    # Outputs: none.
+    # Exceptions: none caught; filesystem errors creating the directory or log file propagate.
+    # Side effects: creates a directory and log file; replaces global logging handlers; changes the
+    # global torch matmul precision setting.
     """Configure logging + TF32. Tees to logs/{RUN_NAME}.log and silences HTTP spam."""
     os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
@@ -146,6 +187,35 @@ def setup_logging():
 
 
 def main() -> None:
+    # [FUNCTION DOC] Train (or just evaluate) the distilled student embedding model.
+    # Behavior: parses --eval-only (ignoring unknown args) and sets up logging. In eval-only mode loads
+    # the given model and runs an STS-B validation similarity evaluator (cosine) under autocast, then
+    # returns. Otherwise loads the teacher and the student (with model card data); appends Normalize
+    # to the student when the teacher normalizes and the student does not; aborts if embedding
+    # dimensions differ; loads the full corpus, gathers unique anchor/positive strings in first-seen
+    # order, takes train_size then eval_size of them (50/20 for smoke); encodes both with the teacher;
+    # builds sentence/label datasets with teacher embeddings as labels; creates MSE loss and the STS-B
+    # evaluator; evaluates the teacher, then the student for the baseline and derives the metric key;
+    # configures training (1 epoch, max 1 step on smoke, batch TRAIN_BATCH_SIZE, lr 1e-4, 10% warmup,
+    # bf16, eval/save every 10%, keep 2, best by metric, Trackio unless smoke, seed 12); trains.
+    # Post-training: re-runs the evaluator, computes delta versus baseline and logs a VERDICT line
+    # (WIN if delta is at least 0.005, MARGINAL if non-negative, else REGRESSION); saves the student
+    # to OUTPUT_DIR/final; unless smoke testing, pushes it to the Hub under RUN_NAME and logs the repo
+    # URL (commit URL with the commit part stripped).
+    # Inputs: none directly; reads the command line and the SMOKE_TEST env var.
+    # Outputs: none returned; logs, checkpoint and final model directories, optional Hub repo.
+    # Exceptions: any error during the Hub push is caught and logged with its traceback; all other
+    # errors (download, out-of-memory, missing bf16 support) propagate.
+    # Side effects: network downloads of models/datasets, GPU usage, filesystem writes, Hub upload,
+    # Trackio reporting (non-smoke).
+    # Exceptions (additional): exits with a message (SystemExit) when student and teacher dimensions
+    # differ.
+    # KNOWN ISSUE: bf16 training is hard-enabled, so training fails on CPU-only machines or GPUs without
+    # bfloat16 support, even though the eval autocast helper handles those cases.
+    # KNOWN ISSUE: the baseline/final evaluator calls here are not wrapped in the autocast helper,
+    # unlike the eval-only path, so baseline and eval-only scores can differ slightly in precision.
+    # KNOWN ISSUE: unique sentences are gathered by iterating every row of the full corpus in Python
+    # even in smoke tests, which is slow regardless of TRAIN_SIZE.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--eval-only", type=str, default=None, help="Skip training; load this saved model and run only the evaluator."
