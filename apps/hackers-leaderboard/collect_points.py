@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# [MODULE DOC] CLI script that computes engagement points for the hf-skills organization hackathon.
+# Behavior: fetches the org's members (seeding them with zero stats), lists all org models,
+# datasets and spaces, credits non-org repo authors with a repo point, and scans each repo's
+# discussions: 1 point per discussion opened, per PR opened and per comment. Optionally scans
+# trending Hub repos for PRs/discussions by org members. Prints a top-20 table, saves JSON
+# locally and optionally uploads JSONL plus metadata to a dataset.
+# Constants: API_BASE (Hub API root), ORG_NAME (hf-skills), USER_AGENT, DISCUSSION_LIMIT (100,
+# discussions requested per repo), TRENDING_LIMIT (50 trending repos per type).
+# CLI arguments: --push-to-hub (flag), --output (JSON path, default leaderboard.json), --repo-id
+# (dataset, default hf-skills/hackers-leaderboard), --scan-external (flag, scan trending
+# repos), --repo-type (one or more of models/datasets/spaces for the external scan; default all).
+# Env vars: HF_TOKEN (optional; used for API session and member listing).
+# Top-level executed code: main runs when executed as a script.
+# Side effects: many network requests, console output, file write, optional dataset upload.
 """
 Collect engagement points from the hf-skills organization.
 
@@ -34,6 +48,11 @@ TRENDING_LIMIT = 50  # Number of trending repos to scan for external PRs
 
 @dataclass
 class UserStats:
+    # [CLASS DOC] Mutable per-user engagement counters (dataclass).
+    # Fields: username; is_org_member (default true); discussions_opened, comments_made,
+    # prs_opened, repos_owned (integers, default 0); activities (list of activity mappings,
+    # default empty).
+    # Side effects: none.
     """Tracks engagement stats for a single user."""
 
     username: str
@@ -46,9 +65,22 @@ class UserStats:
 
     @property
     def total_points(self) -> int:
+        # [FUNCTION DOC] Total points for the user (read-only property).
+        # Behavior: sum of discussions_opened, comments_made, prs_opened and repos_owned.
+        # Inputs: none.
+        # Outputs: integer.
+        # Exceptions: none.
+        # Side effects: none.
         return self.discussions_opened + self.comments_made + self.prs_opened + self.repos_owned
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Serialize stats to a mapping for export.
+        # Behavior: returns username, is_org_member, total_points and the four counters; activities
+        # are not included.
+        # Inputs: none.
+        # Outputs: mapping.
+        # Exceptions: none.
+        # Side effects: none.
         return {
             "username": self.username,
             "is_org_member": self.is_org_member,
@@ -61,9 +93,20 @@ class UserStats:
 
 
 class PointsCollector:
+    # [CLASS DOC] Collects engagement points across hf-skills repos (and optionally trending repos).
+    # Behavior: holds the token, an HTTP session with User-Agent and optional bearer header, a
+    # mapping from username to UserStats and a log list; methods scan repos and export results.
+    # Side effects: network access, console output, file writes (see methods).
     """Collects engagement points from the hf-skills organization."""
 
     def __init__(self, token: str | None = None) -> None:
+        # [FUNCTION DOC] Initialize the collector.
+        # Behavior: stores the token; creates a requests session with User-Agent and, if a token is
+        # given, an Authorization bearer header; initializes empty user_stats and logs.
+        # Inputs: token (optional string, default none).
+        # Outputs: none.
+        # Exceptions: none.
+        # Side effects: none beyond creating the session.
         self.token = token
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
@@ -73,11 +116,25 @@ class PointsCollector:
         self.logs: list[str] = []
 
     def log(self, message: str) -> None:
+        # [FUNCTION DOC] HELPER: Print a message and remember it.
+        # Inputs: message (string).
+        # Outputs: prints to stdout.
+        # Exceptions: none.
+        # Side effects: appends to the logs list.
         """Add a log message."""
         print(message)
         self.logs.append(message)
 
     def _fetch_org_members(self) -> list[str]:
+        # [FUNCTION DOC] HELPER: Get the usernames of all members of ORG_NAME.
+        # Behavior: tries huggingface_hub HfApi list_organization_members with the token, keeping
+        # non-empty usernames; on any failure logs and falls back to GET
+        # /organizations/<org>/members, taking user, username or name from each entry and dropping
+        # empty ones; if that fails too, logs and returns empty.
+        # Inputs: none.
+        # Outputs: list of username strings.
+        # Exceptions: catches and swallows all exceptions from both attempts.
+        # Side effects: network requests; logging.
         """Fetch all members of the organization."""
         try:
             from huggingface_hub import HfApi
@@ -104,6 +161,16 @@ class PointsCollector:
                 return []
 
     def collect_all(self) -> dict[str, UserStats]:
+        # [FUNCTION DOC] Scan every org repo and accumulate points.
+        # Behavior: seeds user_stats with zero stats for each org member; lists org models, datasets
+        # and spaces; for each repo (id or modelId, skipping missing) credits the author (or id
+        # prefix) with repos_owned unless it is the org itself; then scans the repo's discussions.
+        # Inputs: none.
+        # Outputs: a shallow copy of the username-to-UserStats mapping.
+        # Exceptions: none raised deliberately; sub-steps swallow request errors.
+        # Side effects: network requests; logging; mutates user_stats (re-seeding resets members).
+        # KNOWN ISSUE: repos listed with author=hf-skills always have the org as author, so
+        # repos_owned is effectively never awarded despite the documented 1 point per repo owned.
         """Collect points from all repos in the organization."""
         self.log(f"🔍 Scanning organization: {ORG_NAME}")
 
@@ -141,6 +208,16 @@ class PointsCollector:
         return dict(self.user_stats)
 
     def scan_external_repos(self, repo_types: list[str] | None = None) -> None:
+        # [FUNCTION DOC] Scan trending Hub repos for PRs and discussions authored by org members.
+        # Behavior: uses current user_stats keys as members (logs and returns if empty, so
+        # collect_all must run first); defaults to all three repo types; for each type fetches
+        # trending repos, skips ones without id and those inside the org, and scans each for members.
+        # Inputs: repo_types (optional list of 'models', 'datasets', 'spaces'; default all).
+        # Outputs: none.
+        # Exceptions: none raised; sub-steps swallow request errors.
+        # Side effects: very many network requests (two per member per repo); logging; mutates stats.
+        # KNOWN ISSUE: the member set includes external contributors already added by collect_all,
+        # not only org members, since it is taken from all user_stats keys.
         """Scan trending repos across the Hub for PRs by org members.
 
         Args:
@@ -175,6 +252,12 @@ class PointsCollector:
                 self._scan_repo_for_members(repo_id, repo_type, org_members)
 
     def _fetch_trending(self, repo_type: str) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Fetch trending repos of one type.
+        # Behavior: GETs /<repo_type> sorted by trendingScore with limit TRENDING_LIMIT (30 s timeout).
+        # Inputs: repo_type (string: models, datasets or spaces).
+        # Outputs: parsed JSON (expected list of repo mappings), or empty list on request failure.
+        # Exceptions: swallows request errors with a log; JSON decode errors propagate.
+        # Side effects: one network request.
         """Fetch trending repos of a given type."""
         endpoint = f"{API_BASE}/{repo_type}"
         params = {"sort": "trendingScore", "limit": TRENDING_LIMIT}
@@ -188,6 +271,14 @@ class PointsCollector:
             return []
 
     def _scan_repo_for_members(self, repo_id: str, repo_type: str, org_members: set[str]) -> None:
+        # [FUNCTION DOC] HELPER: Look up each member's PRs and discussions on a single repo.
+        # Behavior: splits repo id into namespace and name (returns if not exactly two parts); for
+        # every member queries discussions filtered by author with type pull_request, then again
+        # with type discussion.
+        # Inputs: repo_id (string); repo_type (API path segment); org_members (set of usernames).
+        # Outputs: none.
+        # Exceptions: none.
+        # Side effects: two network requests per member (plus comment fetches); mutates stats.
         """Scan a repo's discussions for activity by org members using author filter."""
         # Parse namespace and repo from repo_id
         parts = repo_id.split("/")
@@ -220,6 +311,18 @@ class PointsCollector:
         author: str,
         discussion_type: str = "all",
     ) -> None:
+        # [FUNCTION DOC] HELPER: Credit one author's discussions/PRs on a repo and their comments there.
+        # Behavior: GETs /<type>/<ns>/<repo>/discussions with author, type and status=all; on request
+        # failure returns silently; for each returned discussion awards prs_opened or
+        # discussions_opened (activity external_pr / external_discussion) and logs it; if it has
+        # comments, fetches it to count the author's comments.
+        # Inputs: repo_type, namespace, repo, author (strings); discussion_type (string, default all).
+        # Outputs: none.
+        # Exceptions: swallows request errors silently.
+        # Side effects: network requests; logging; mutates stats.
+        # KNOWN ISSUE: if the API ignores the author or type filter, discussions by others are
+        # credited to this author and items may be counted twice across the two type queries.
+        # KNOWN ISSUE: only comments on discussions the author opened are counted externally.
         """Fetch discussions for a specific author on a repo.
 
         Uses: GET /api/{repoType}/{namespace}/{repo}/discussions?author={author}&type={type}
@@ -265,6 +368,16 @@ class PointsCollector:
         disc_num: int,
         target_author: str,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Count a target author's comments on one external discussion.
+        # Behavior: GETs the discussion details; on request failure returns silently; for each
+        # comment event whose author name (or fullname) equals target_author, awards comments_made
+        # with activity external_comment.
+        # Inputs: repo_type, namespace, repo (strings); disc_num (integer); target_author (string).
+        # Outputs: none.
+        # Exceptions: swallows request errors silently.
+        # Side effects: one network request; mutates stats.
+        # KNOWN ISSUE: the opening post is usually itself a comment event, so the author also gets a
+        # comment point for the discussion they opened.
         """Fetch comments on a discussion and count those by target author."""
         url = f"{API_BASE}/{repo_type}/{namespace}/{repo}/discussions/{disc_num}"
 
@@ -285,6 +398,12 @@ class PointsCollector:
                     self._add_point(author, "comments_made", repo_id, "external_comment", disc_num)
 
     def _list_repos(self, repo_type: str) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: List all org repos of one type.
+        # Behavior: GETs /<repo_type> with author=ORG_NAME and limit 1000 (30 s timeout).
+        # Inputs: repo_type (models, datasets or spaces).
+        # Outputs: parsed JSON list of repo mappings, or empty list on request failure.
+        # Exceptions: swallows request errors with a log.
+        # Side effects: one network request.
         """List all repos of a given type in the organization."""
         endpoint = f"{API_BASE}/{repo_type}"
         params = {"author": ORG_NAME, "limit": 1000}
@@ -298,6 +417,14 @@ class PointsCollector:
             return []
 
     def _scan_discussions(self, repo_id: str, repo_type: str) -> None:
+        # [FUNCTION DOC] HELPER: Fetch a repo's discussions and process each one.
+        # Behavior: maps singular repo type to API path (default models); GETs the discussions list
+        # with limit DISCUSSION_LIMIT; on failure logs and returns; logs the count and processes each
+        # discussion.
+        # Inputs: repo_id (string); repo_type (model, dataset or space).
+        # Outputs: none.
+        # Exceptions: swallows request errors with a log.
+        # Side effects: network requests; logging; mutates stats.
         """Scan all discussions for a repo and count engagement."""
         # Map repo type to API path
         type_map = {"model": "models", "dataset": "datasets", "space": "spaces"}
@@ -323,6 +450,15 @@ class PointsCollector:
             self._process_discussion(repo_id, api_type, discussion)
 
     def _process_discussion(self, repo_id: str, api_type: str, discussion: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Award points for one discussion's opener and its comments.
+        # Behavior: reads author name (or fullname), PR flag and number; if author exists and is not
+        # the org, awards prs_opened or discussions_opened; if a number exists, fetches comments.
+        # Inputs: repo_id (string); api_type (API path segment); discussion (mapping).
+        # Outputs: none.
+        # Exceptions: none.
+        # Side effects: network request for comments; mutates stats.
+        # KNOWN ISSUE: a discussion numbered 0 would be skipped by the truthiness check (numbers
+        # normally start at 1).
         """Process a single discussion and its comments."""
         author_info = discussion.get("author", {}) or {}
         author = author_info.get("name") or author_info.get("fullname")
@@ -339,6 +475,15 @@ class PointsCollector:
             self._fetch_comments(repo_id, api_type, disc_num)
 
     def _fetch_comments(self, repo_id: str, api_type: str, disc_num: int) -> None:
+        # [FUNCTION DOC] HELPER: Award a comment point for every comment on an org discussion.
+        # Behavior: GETs the discussion details; silently returns on request failure; for each event
+        # of type comment with an author other than the org, awards comments_made (activity comment).
+        # Inputs: repo_id (string); api_type (string); disc_num (integer).
+        # Outputs: none.
+        # Exceptions: swallows request errors silently.
+        # Side effects: one network request; mutates stats.
+        # KNOWN ISSUE: the opening post is typically a comment event, so openers are double-counted
+        # (discussion/PR point plus a comment point).
         """Fetch and count comments on a discussion."""
         url = f"{API_BASE}/{api_type}/{repo_id}/discussions/{disc_num}"
 
@@ -368,6 +513,16 @@ class PointsCollector:
         activity_type: str,
         disc_num: int | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Increment a counter for a user and record the activity.
+        # Behavior: ignores empty usernames; creates non-member stats for unknown users; adds 1 to the
+        # named counter attribute (treating missing as 0); appends an activity with type, repo_id,
+        # discussion_num and current UTC timestamp.
+        # Inputs: username, point_type (counter attribute name), repo_id, activity_type (strings);
+        # disc_num (optional integer, default none).
+        # Outputs: none.
+        # Exceptions: none.
+        # Side effects: mutates user_stats.
+        # KNOWN ISSUE: an unknown point_type would silently create a new attribute instead of failing.
         """Add a point to a user's stats."""
         if not username:
             return
@@ -390,12 +545,24 @@ class PointsCollector:
         )
 
     def get_leaderboard(self) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] Return all users' stats as mappings sorted by total points, highest first.
+        # Inputs: none.
+        # Outputs: list of mappings.
+        # Exceptions: none.
+        # Side effects: none.
         """Get the leaderboard sorted by total points."""
         leaderboard = [stats.to_dict() for stats in self.user_stats.values()]
         leaderboard.sort(key=lambda x: x["total_points"], reverse=True)
         return leaderboard
 
     def save_json(self, filepath: str) -> None:
+        # [FUNCTION DOC] Write the leaderboard to a local JSON file.
+        # Behavior: writes generated_at, organization, total_participants and leaderboard, indented
+        # by 2; logs the path.
+        # Inputs: filepath (string).
+        # Outputs: file written (overwritten).
+        # Exceptions: propagates file system errors.
+        # Side effects: file write; logging.
         """Save the leaderboard to a JSON file."""
         leaderboard = self.get_leaderboard()
         output = {
@@ -409,6 +576,16 @@ class PointsCollector:
         self.log(f"💾 Saved leaderboard to {filepath}")
 
     def push_to_hub(self, repo_id: str = "hf-skills/hackers-leaderboard") -> None:
+        # [FUNCTION DOC] Upload the leaderboard and metadata to a Hugging Face dataset repo.
+        # Behavior: imports HfApi (logs and returns if missing); builds JSONL rows and metadata
+        # (generated_at, organization, total_participants, total_points); creates the dataset repo
+        # if needed and uploads data/leaderboard.jsonl and data/metadata.json; logs success.
+        # Inputs: repo_id (string, default hf-skills/hackers-leaderboard).
+        # Outputs: none.
+        # Exceptions: catches ImportError and any upload exception, logging them only.
+        # Side effects: network repo creation and commits; logging.
+        # KNOWN ISSUE: HfApi is created without the collector's token, so it relies on a cached
+        # login or HF_TOKEN in the environment.
         """Push the leaderboard data to a HF dataset."""
         try:
             from huggingface_hub import HfApi
@@ -459,6 +636,15 @@ class PointsCollector:
 
 
 def main() -> None:
+    # [FUNCTION DOC] CLI entry point: collect, print, save and optionally push the hackers leaderboard.
+    # Behavior: parses arguments; reads HF_TOKEN (warns if absent); runs collect_all, then the
+    # external scan if requested; prints a banner and up to 20 ranked users with points and
+    # counter breakdown, a remaining count, totals; saves JSON; pushes if requested.
+    # Inputs: command-line arguments (see module doc).
+    # Outputs: console output, JSON file, optional upload. Exit code 0 unless an uncaught
+    # exception occurs (argparse exits 2 on bad arguments).
+    # Exceptions: none caught here.
+    # Side effects: env var read, network, file write, stdout.
     parser = argparse.ArgumentParser(description="Collect engagement points from hf-skills organization")
     parser.add_argument(
         "--push-to-hub",
