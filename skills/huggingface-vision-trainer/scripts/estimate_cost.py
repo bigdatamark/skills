@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+# [MODULE DOC] CLI that estimates wall-clock time and dollar cost of a vision fine-tuning job
+# on Hugging Face Jobs and prints example job configurations.
+# Behavior: looks up an approximate parameter count from the model name, a dataset size from a
+# small table or CLI flag, applies an empirical per-step time formula scaled by model size, image
+# size, batch size and a per-hardware speed multiplier, adds overhead, then prints time, cost,
+# a 30 percent padded timeout, warnings, and copy-paste job snippets. The comment block after this
+# one is PEP 723 inline script metadata (Python 3.10 or newer, no dependencies).
+# CLI arguments: --model (required, model id or name); --dataset (optional, used for size lookup
+# and in the snippet); --hardware (required, one of the hardware cost table keys);
+# --dataset-size (optional integer, overrides lookup); --epochs (default 30); --image-size
+# (default 640, square side in pixels); --batch-size (default 8, per device).
+# Env vars: none.
+# Constants: HARDWARE_COSTS maps hardware flavor to US dollars per hour; MODEL_PARAMS_M maps
+# model-name substrings to parameter counts in millions (detection, classification, SAM/SAM2);
+# KNOWN_DATASETS maps a few dataset ids to their training image counts.
+# Top-level executed code: runs main when executed as a script.
+# Side effects: prints to stdout only; no network or file access.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = []
@@ -69,6 +86,13 @@ KNOWN_DATASETS = {
 
 
 def extract_model_params(model_name: str) -> float:
+    # [FUNCTION DOC] HELPER: Estimate a model's size from its name.
+    # Behavior: lowercases the name and returns the parameter count of the first table key (in table
+    # order) that occurs as a substring; falls back to 30 million.
+    # Inputs: model_name (string) - Hub id or short model name.
+    # Outputs: parameter count in millions (float).
+    # Exceptions: none.
+    # Side effects: none.
     """Extract model size in millions of parameters from the model name."""
     name_lower = model_name.lower()
     for key, params in MODEL_PARAMS_M.items():
@@ -79,6 +103,18 @@ def extract_model_params(model_name: str) -> float:
 
 def estimate_training_time(model_params_m: float, dataset_size: int, epochs: int,
                            image_size: int, batch_size: int, hardware: str) -> float:
+    # [FUNCTION DOC] Estimate total training hours for a vision fine-tuning job.
+    # Behavior: steps per epoch = dataset size / batch size. Seconds per step = 0.8 times
+    # (params/30)^0.6 times (image size/640)^2 times (batch size/8)^0.7. Multiplies total steps by
+    # seconds per step and a per-hardware multiplier (T4 2.0, L4 1.2, A10G small/large 1.0, faster
+    # multi-GPU and A100/L40S flavors below 1; unknown hardware 1.0). Adds 10 percent for evaluation
+    # and a fixed 5 minutes for loading and Hub push, then converts seconds to hours.
+    # Inputs: model_params_m (float, millions of parameters); dataset_size (integer, training
+    # images); epochs (integer); image_size (integer, pixels); batch_size (integer); hardware
+    # (string, flavor name).
+    # Outputs: estimated duration in hours (float).
+    # Exceptions: division by zero if batch_size is 0.
+    # Side effects: none.
     """Estimate training time in hours for vision model training."""
     # Steps per epoch
     steps_per_epoch = dataset_size / batch_size
@@ -120,6 +156,14 @@ def estimate_training_time(model_params_m: float, dataset_size: int, epochs: int
 
 
 def parse_args():
+    # [FUNCTION DOC] HELPER: Define and parse the command-line arguments of the estimator.
+    # Behavior: builds the parser described in the module block and parses the process arguments;
+    # --hardware is restricted to the hardware cost table keys.
+    # Inputs: none (reads the process argument list).
+    # Outputs: a namespace with model, dataset, hardware, dataset_size, epochs, image_size,
+    # batch_size.
+    # Exceptions: the parser exits with code 2 on invalid or missing arguments.
+    # Side effects: may write usage text to stderr.
     parser = argparse.ArgumentParser(description="Estimate training cost for vision model training jobs")
     parser.add_argument("--model", required=True,
                         help="Model name (e.g., 'ustc-community/dfine-small-coco' or 'detr-resnet-50')")
@@ -134,6 +178,20 @@ def parse_args():
 
 
 def main():
+    # [FUNCTION DOC] Entry point: compute and print the time/cost estimate and job snippets.
+    # Behavior: parses arguments; resolves the parameter count; resolves dataset size from the
+    # explicit flag, else the known-dataset table, else 1000 (printing a hint when an unknown dataset
+    # name was given). Prints the inputs, computes hours, cost (hours times hourly rate) and a
+    # timeout of 1.3 times the hours, and prints them. Warns when the estimate exceeds 6 hours and
+    # when a model over 50M parameters runs on a T4 flavor. Finally prints an "hf_jobs" MCP-tool
+    # example and a Python API example with the timeout in whole hours and in seconds.
+    # Inputs: none directly (CLI arguments).
+    # Outputs: text on stdout; exit code 0.
+    # Exceptions: none deliberately.
+    # Side effects: stdout output only.
+    # KNOWN ISSUE: an explicit --dataset-size of 0 is treated as not given and silently replaced.
+    # KNOWN ISSUE: the printed job snippets always reference object_detection_training.py and its
+    # flags, even for image classification or SAM models.
     args = parse_args()
 
     model_params = extract_model_params(args.model)

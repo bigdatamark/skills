@@ -1,3 +1,20 @@
+# [MODULE DOC] Example script: LoRA supervised fine-tuning of a chat LLM with Unsloth + TRL.
+# Behavior overview: loads a base model in 16-bit with LoRA adapters, loads a conversation
+#   dataset from the Hub, applies the tokenizer chat template, optionally splits off an eval set,
+#   trains with SFTTrainer masking user turns (loss only on assistant responses), then saves and
+#   pushes either the adapter or a merged 16-bit model to the Hub.
+# CLI arguments: --base-model (default LiquidAI/LFM2.5-1.2B-Instruct), --dataset (required),
+#   --output-repo (required), --num-epochs (float), --max-steps (int), --batch-size (2),
+#   --gradient-accumulation (4), --learning-rate (2e-4), --max-seq-length (2048), --lora-r (16),
+#   --lora-alpha (16), --trackio-space, --run-name, --save-local (unsloth-output),
+#   --eval-split (0.0), --num-samples, --seed (3407), --merge-model flag.
+# Env vars: reads HF_TOKEN (falling back to "hfjob") for Hub login; sets
+#   HF_HUB_ENABLE_HF_TRANSFER to "1" and TRACKIO_SPACE_ID when a Trackio space is given.
+# Top-level executed code: reconfigures stdout/stderr to line buffering, configures root logging
+#   at INFO with a timestamped format, creates the module logger. As a script with no arguments,
+#   prints a feature/usage banner and exits 0; otherwise runs main.
+# Side effects: GPU use, model/dataset downloads, local checkpoint files in the save directory,
+#   Hub uploads, optional TensorBoard/Trackio logging.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -56,6 +73,13 @@ logger = logging.getLogger(__name__)
 
 
 def check_cuda():
+    # [FUNCTION DOC] HELPER: Ensure a CUDA GPU is available, otherwise exit.
+    # Behavior: imports torch lazily; if CUDA is not available logs errors with an HF Jobs hint and
+    #   exits; otherwise logs the name of GPU 0.
+    # Inputs: none.
+    # Outputs: none.
+    # Exceptions: none caught; the process exits with code 1 when no GPU (SystemExit).
+    # Side effects: imports torch, logging, possible process exit.
     """Check CUDA availability and exit if not available."""
     import torch
 
@@ -70,6 +94,14 @@ def check_cuda():
 
 
 def parse_args():
+    # [FUNCTION DOC] HELPER: Define and parse the command-line options.
+    # Behavior: builds a parser with an examples epilog and the options listed in the module doc
+    #   (model/data, training, LoRA, logging, eval/data control, merge flag), then parses argv.
+    # Inputs: none (reads command-line arguments).
+    # Outputs: the parsed argument namespace.
+    # Exceptions: argparse exits with code 2 on invalid/missing required arguments.
+    # Side effects: may print help/usage and exit.
+    # KNOWN ISSUE: --eval-split help claims a 0.0-0.5 range but no range validation is performed.
     parser = argparse.ArgumentParser(
         description="Fine-tune LLMs with Unsloth optimizations",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -213,6 +245,36 @@ Examples:
 
 
 def main():
+    # [FUNCTION DOC] Run the full fine-tuning pipeline end to end.
+    # Behavior: 1) parse args; if neither epochs nor steps given, default to 1 epoch. 2) print the
+    #   configuration. 3) check CUDA, enable hf_transfer, set Trackio space env var if given.
+    #   4) import Unsloth/datasets/TRL/hub lazily; log in with HF_TOKEN or "hfjob" if present, else
+    #   warn. 5) load the model in 16-bit (no 4/8-bit, no full fine-tuning) and attach LoRA adapters
+    #   on attention/MLP projection modules (rank/alpha from args, no dropout, Unsloth gradient
+    #   checkpointing, seeded). 6) load the dataset train split, optionally truncate to num-samples,
+    #   rename the first list-valued column among messages/conversations/conversation to
+    #   "conversations", standardize formats, render each conversation with the chat template into a
+    #   "text" field (stripping a leading BOS token). 7) optionally split train/test by eval-split.
+    #   8) derive run name, logging steps (1/10 epoch or 1/20 of max steps) and save steps (1/4), and
+    #   reporting backends (tensorboard, plus trackio). 9) build SFTConfig (adamw 8-bit, linear
+    #   schedule, warmup 5, push_to_hub during training, keep 3 checkpoints) and enable per-epoch or
+    #   per-step eval when eval data exists. 10) create SFTTrainer and wrap with
+    #   train_on_responses_only using ChatML user/assistant markers. 11) train, print time, speed and
+    #   final loss; run a final evaluation and warn if eval loss exceeds 1.5x train loss. 12) if
+    #   merge-model, push merged 16-bit weights; otherwise save adapter and tokenizer locally and
+    #   push the adapter.
+    # Inputs: none (command-line arguments and environment).
+    # Outputs: progress text on stdout; model artifacts locally and on the Hub; returns nothing.
+    # Exceptions: exceptions during final evaluation are caught and reported as a warning; all other
+    #   errors propagate.
+    # Side effects: env vars set, network logins/downloads/uploads, GPU training, files written.
+    # KNOWN ISSUE: when both --num-epochs and --max-steps are given, max_steps still overrides epochs
+    #   in the trainer while logging/steps-per-epoch messages assume epoch mode.
+    # KNOWN ISSUE: the speed metric reads a "train_steps" metric the trainer does not normally
+    #   report, so it almost always uses the estimate (which may be a float in epoch mode).
+    # KNOWN ISSUE: response masking assumes ChatML "<|im_start|>" markers; models with another chat
+    #   template would get all tokens masked or wrong masking.
+    # KNOWN ISSUE: final train/eval loss values of exactly 0 are treated as missing and not printed.
     args = parse_args()
 
     # Validate epochs/steps configuration
@@ -319,6 +381,15 @@ def main():
 
     # Apply chat template
     def formatting_prompts_func(examples):
+        # [FUNCTION DOC] HELPER: Batched map function rendering conversations into training text.
+        # Behavior: applies the tokenizer chat template (no tokenization, no generation prompt) to the
+        #   batch's "conversations" column and removes a leading BOS token string from each result to
+        #   avoid duplicate BOS at tokenization time.
+        # Inputs: examples (batch mapping with a "conversations" list of message lists).
+        # Outputs: mapping with a "text" list of strings.
+        # Exceptions: none caught.
+        # Side effects: none (uses the enclosing tokenizer).
+        # KNOWN ISSUE: fails if the tokenizer has no BOS token (prefix removal with a missing value).
         texts = tokenizer.apply_chat_template(
             examples["conversations"],
             tokenize=False,

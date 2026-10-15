@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Example script: DPO preference training of Qwen2.5-0.5B-Instruct with TRL.
+# Behavior (top-level, no functions): loads trl-lib/ultrafeedback_binarized (train split),
+# splits 90/10 into train/eval with seed 42, builds a DPO config (output dir
+# "qwen-dpo-aligned", push to Hub repo "username/qwen-dpo-aligned" on every save, beta 0.1,
+# 1 epoch, batch 4 with 4 accumulation steps, LR 5e-7, logging every 10 steps, save and eval
+# every 100 steps keeping 2 checkpoints, 10% warmup, cosine schedule, Trackio reporting with
+# placeholder project/run names), trains, pushes to the Hub, finishes Trackio tracking and
+# prints links.
+# CLI arguments: none. Env vars: Hub token (e.g. HF_TOKEN) is used implicitly for pushing.
+# Constants: hard-coded dataset, model and placeholder "username" repo IDs.
+# Outputs: progress prints; checkpoints in the output directory; model pushed to the Hub.
+# Side effects: network downloads/uploads, GPU training, filesystem writes, Trackio logging.
+# KNOWN ISSUE: "datasets" is imported but not declared in the inline script dependencies
+# (it relies on being pulled in transitively by trl).
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [

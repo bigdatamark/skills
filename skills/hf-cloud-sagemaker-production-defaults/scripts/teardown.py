@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# [MODULE DOC] CLI script that deletes a SageMaker endpoint and its related resources via the aws CLI.
+# Behavior: discovers the endpoint's config, models (from production variants and from inference
+#   components) and inference components, then deletes in order: CloudWatch alarms (by name
+#   prefix), autoscaling policies and scalable targets, inference components (with retries),
+#   endpoint, endpoint config, models. Missing resources are skipped. Does not delete the IAM
+#   role, data-capture S3 objects, SNS topics or model artifacts.
+# CLI arguments: required endpoint name; optional region.
+# Env vars: AWS_REGION, then AWS_DEFAULT_REGION, used if no region argument; aws subprocesses
+#   inherit the shell's AWS configuration.
+# Constants: VARIANT_DIM - scalable dimension for variant instance count; IC_DIM - scalable
+#   dimension for inference-component copy count.
+# Top-level executed code: the main-guard that runs main and exits with its return code.
+# Outputs: logs on stderr. Exit codes: 0 done, 1 no region, 2 aws CLI missing, 64 usage error.
 """Tear down a SageMaker endpoint and its associated resources. Cross-platform.
 
 Deletes in safe order: alarms -> autoscaling -> inference components ->
@@ -34,10 +47,22 @@ IC_DIM = "sagemaker:inference-component:DesiredCopyCount"
 
 
 def log(msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Write a "[teardown]"-prefixed message to stderr.
+    # Behavior: prints the prefixed message to stderr and flushes.
+    # Inputs: msg - text.
+    # Outputs: none returned; one stderr line.
+    # Exceptions: none.
+    # Side effects: writes to stderr.
     print(f"[teardown] {msg}", file=sys.stderr, flush=True)
 
 
 def aws_bin() -> str:
+    # [FUNCTION DOC] HELPER: Resolve the aws CLI executable path or exit.
+    # Behavior: looks up "aws" on PATH; if absent logs an error and exits the process with code 2.
+    # Inputs: none.
+    # Outputs: the aws executable path.
+    # Exceptions: terminates via system exit (code 2) when not found.
+    # Side effects: PATH lookup; stderr logging; may exit the process.
     exe = shutil.which("aws")
     if not exe:
         log("ERROR: the 'aws' CLI was not found on PATH. Install AWS CLI v2.")
@@ -46,10 +71,23 @@ def aws_bin() -> str:
 
 
 def run_aws(args: list[str]) -> subprocess.CompletedProcess:
+    # [FUNCTION DOC] HELPER: Run an aws CLI command, capturing text output, without checking the exit code.
+    # Behavior: runs the aws executable with the given arguments.
+    # Inputs: args - CLI argument strings after "aws".
+    # Outputs: the completed-process result.
+    # Exceptions: none caught; aws_bin may exit the process.
+    # Side effects: spawns an aws subprocess (AWS API calls).
     return subprocess.run([aws_bin(), *args], capture_output=True, text=True)
 
 
 def json_out(proc: subprocess.CompletedProcess, default):
+    # [FUNCTION DOC] HELPER: Parse a completed aws process's stdout as JSON, falling back to a default.
+    # Behavior: returns the default if the process failed, if stdout is not valid JSON, or if the
+    #   parsed value is empty/falsy; otherwise returns the parsed value.
+    # Inputs: proc - completed-process result; default - value to return on failure.
+    # Outputs: parsed JSON value or the default.
+    # Exceptions: catches JSON decode errors.
+    # Side effects: none.
     if proc.returncode != 0:
         return default
     try:
@@ -59,6 +97,14 @@ def json_out(proc: subprocess.CompletedProcess, default):
 
 
 def resolve_region(arg_region: str | None) -> str:
+    # [FUNCTION DOC] HELPER: Determine the AWS region to use.
+    # Behavior: returns the argument if non-empty; else the first non-empty of AWS_REGION and
+    #   AWS_DEFAULT_REGION; else the output of "aws configure get region" if that succeeds; else an
+    #   empty string.
+    # Inputs: arg_region - region from the command line, or none.
+    # Outputs: region string, possibly empty.
+    # Exceptions: none caught.
+    # Side effects: reads environment variables; may spawn an aws subprocess.
     """Region from arg, then env, then the active profile's config."""
     if arg_region:
         return arg_region
@@ -70,6 +116,16 @@ def resolve_region(arg_region: str | None) -> str:
 
 
 def delete_alarms(prefix: str, reg: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: Delete all CloudWatch alarms whose names start with a prefix.
+    # Behavior: lists alarm names with the prefix; if any, deletes them in one call (result not
+    #   checked) and logs them.
+    # Inputs: prefix - alarm name prefix; reg - region arguments appended to each aws call.
+    # Outputs: none.
+    # Exceptions: none caught.
+    # Side effects: CloudWatch API calls via aws subprocesses; stderr logging.
+    # KNOWN ISSUE: describe-alarms results and delete-alarms (max 100 names per call) are not
+    #   handled for very large alarm sets, and prefix matching can delete alarms of another endpoint
+    #   whose name merely starts with this endpoint's name plus a hyphen.
     alarms = json_out(
         run_aws(["cloudwatch", "describe-alarms", "--alarm-name-prefix", prefix,
                  "--query", "MetricAlarms[*].AlarmName", "--output", "json", *reg]),
@@ -81,6 +137,16 @@ def delete_alarms(prefix: str, reg: list[str]) -> None:
 
 
 def delete_scaling_stack(resource_id: str, dimension: str, reg: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: Remove all autoscaling policies for a resource, then deregister its target.
+    # Behavior: lists scaling policy names for the resource in the sagemaker namespace and deletes
+    #   each (results unchecked, each logged); then lists scalable targets for the resource and, if
+    #   it is registered, deregisters it with the given dimension and logs.
+    # Inputs: resource_id - Application Auto Scaling resource id; dimension - scalable dimension;
+    #   reg - region arguments.
+    # Outputs: none.
+    # Exceptions: none caught.
+    # Side effects: Application Auto Scaling API calls via aws subprocesses; stderr logging.
+    # KNOWN ISSUE: success is logged even if a delete/deregister command failed.
     """Delete every scaling policy on a target, then deregister the target."""
     policies = json_out(
         run_aws(["application-autoscaling", "describe-scaling-policies",
@@ -108,6 +174,13 @@ def delete_scaling_stack(resource_id: str, dimension: str, reg: list[str]) -> No
 
 
 def list_inference_components(endpoint_name: str, reg: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: List inference component names attached to an endpoint.
+    # Behavior: runs "sagemaker list-inference-components" filtered by endpoint name and returns the
+    #   names, or an empty list on failure.
+    # Inputs: endpoint_name; reg - region arguments.
+    # Outputs: list of component names.
+    # Exceptions: none caught.
+    # Side effects: aws subprocess / SageMaker API call.
     return json_out(
         run_aws(["sagemaker", "list-inference-components",
                  "--endpoint-name-equals", endpoint_name,
@@ -118,6 +191,13 @@ def list_inference_components(endpoint_name: str, reg: list[str]) -> list[str]:
 
 
 def component_model_name(ic_name: str, reg: list[str]) -> str:
+    # [FUNCTION DOC] HELPER: Return the model name backing an inference component.
+    # Behavior: describes the component and returns Specification.ModelName, or an empty string if
+    #   unavailable.
+    # Inputs: ic_name - component name; reg - region arguments.
+    # Outputs: model name or empty string.
+    # Exceptions: none caught.
+    # Side effects: aws subprocess / SageMaker API call.
     desc = json_out(
         run_aws(["sagemaker", "describe-inference-component",
                  "--inference-component-name", ic_name, *reg]),
@@ -128,6 +208,16 @@ def component_model_name(ic_name: str, reg: list[str]) -> str:
 
 def delete_inference_components(ic_names: list[str], reg: list[str],
                                 timeout_seconds: int = 900) -> None:
+    # [FUNCTION DOC] HELPER: Delete inference components, retrying until they are gone or a timeout.
+    # Behavior: while some remain and before the deadline: for each pending component log once,
+    #   issue a delete (result ignored), then keep only those that still describe successfully; if
+    #   any remain, sleep 15 seconds. Retrying handles transient states and adapter-before-base
+    #   ordering. Finally logs a warning listing leftovers, or success.
+    # Inputs: ic_names - component names; reg - region arguments; timeout_seconds (default 900).
+    # Outputs: none.
+    # Exceptions: none caught.
+    # Side effects: repeated SageMaker API calls via aws subprocesses; sleeps; stderr logging.
+    # KNOWN ISSUE: any describe failure (e.g. throttling or permissions) is treated as "deleted".
     """Delete components and wait until they are gone.
 
     Retries the delete on every poll, because SageMaker refuses it in two
@@ -163,6 +253,21 @@ def delete_inference_components(ic_names: list[str], reg: list[str],
 
 
 def main() -> int:
+    # [FUNCTION DOC] Tear down the named endpoint and related resources; the script entry point.
+    # Behavior: 1) require an endpoint name (return 64 otherwise); resolve the region, return 1 if
+    #   none; 2) describe the endpoint; if found note its config name, else log and continue looking
+    #   for orphans; 3) collect model names from the config's production variants; 4) list inference
+    #   components and add their models; 5) delete alarms prefixed "<endpoint>-" and
+    #   "<component>-"; 6) delete scaling stacks for the AllTraffic variant and each component;
+    #   7) delete components; 8) delete the endpoint if it existed; 9) delete the config if it still
+    #   describes; 10) delete each model that still describes; 11) log completion.
+    # Inputs: none (reads the process command-line arguments).
+    # Outputs: returns 0, 1 or 64; logs on stderr.
+    # Exceptions: none caught.
+    # Side effects: many AWS API calls deleting resources; stderr logging.
+    # KNOWN ISSUE: delete-endpoint is asynchronous and not awaited, so the immediate config/model
+    #   deletes can race the endpoint deletion; deletion results are never checked yet logged as
+    #   done, and the exit code is 0 even when deletes fail.
     if len(sys.argv) < 2:
         log(f"Usage: {os.path.basename(sys.argv[0])} <endpoint-name> [<region>]")
         return 64

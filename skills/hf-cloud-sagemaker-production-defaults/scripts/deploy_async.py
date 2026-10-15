@@ -1,4 +1,24 @@
 #!/usr/bin/env python
+# [MODULE DOC] CLI script that deploys a SageMaker asynchronous-inference endpoint with production
+# defaults using boto3, including scale-to-zero and a wake-from-zero step-scaling path.
+# Behavior: parses flags, creates (or reuses) the model and an async endpoint config (S3 output,
+#   optional failure path and SNS notifications, per-instance concurrency), creates the endpoint
+#   and waits for InService, registers backlog-based target tracking plus a step-scaling
+#   wake-from-zero policy, looks up that policy's ARN, creates backlog, failure and
+#   HasBacklogWithoutCapacity alarms (the last one triggering the step policy), logs a summary
+#   and prints a JSON summary.
+# CLI arguments: required --model-name, --image-uri, --role-arn, --instance-type, --region,
+#   --output-s3-uri; optional --model-s3-uri, repeatable --env KEY=VALUE,
+#   --inference-ami-version, --failure-s3-uri, --success-sns-topic, --error-sns-topic,
+#   --endpoint-name, --project, --environment (default "dev"), --initial-instance-count,
+#   --min-capacity (default 0), --max-capacity, --backlog-per-instance-target,
+#   --max-concurrent-invocations-per-instance, --no-autoscaling, --sns-alarm-topic, --no-alarms.
+# Env vars: none read directly; boto3 uses the standard AWS credential chain.
+# Constants: DEFAULTS - default capacities, backlog target, cooldowns, wake step size,
+#   concurrency, alarm thresholds/periods and environment tag.
+# Top-level executed code: imports helpers from the sibling _common module; main-guard runs main.
+# Outputs: progress on stderr; one JSON line on stdout (adds inference mode and output URI);
+#   exit 0 on success, otherwise a system exit message or uncaught exception.
 """Create a SageMaker async-inference endpoint with production defaults.
 
 Minimal usage:
@@ -56,6 +76,12 @@ DEFAULTS = {
 
 
 def log(msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Log a message to stderr with the "deploy_async" prefix.
+    # Behavior: delegates to the shared logger.
+    # Inputs: msg - text.
+    # Outputs: none returned; one stderr line.
+    # Exceptions: none.
+    # Side effects: writes to stderr.
     _log("deploy_async", msg)
 
 
@@ -67,6 +93,20 @@ def create_async_endpoint_config(
     max_concurrent_invocations: int,
     tags: list[dict],
 ) -> str:
+    # [FUNCTION DOC] Create an async-inference endpoint config, reusing it if it already exists.
+    # Behavior: builds an "AllTraffic" variant (model, instance type, initial count, weight 1.0,
+    #   optional InferenceAmiVersion); builds an output config with the S3 output path, optional
+    #   failure path and optional SNS success/error topics; wraps it with a client config holding
+    #   max concurrent invocations per instance; calls create_endpoint_config with the variant,
+    #   async config and tags. An "already existing" client error is logged as reuse; others raise.
+    # Inputs (keyword-only after sm): sm - boto3 SageMaker client; config_name; model_name;
+    #   instance_type; initial_instance_count; inference_ami_version (or none); output_s3_uri;
+    #   failure_s3_uri, success_topic_arn, error_topic_arn (each optional); max_concurrent_invocations;
+    #   tags.
+    # Outputs: the config name.
+    # Exceptions: swallows the already-exists client error; re-raises others.
+    # Side effects: AWS API call; stderr logging.
+    # KNOWN ISSUE: a reused config is not compared to the requested settings.
     log(f"Creating async endpoint config: {config_name}")
 
     production_variant: dict[str, Any] = {
@@ -116,6 +156,12 @@ def create_async_endpoint_config(
 
 
 def create_endpoint(sm: Any, *, endpoint_name: str, config_name: str, tags: list[dict]) -> None:
+    # [FUNCTION DOC] Create the SageMaker endpoint from a config.
+    # Behavior: logs and calls create_endpoint with name, config and tags; does not wait or reuse.
+    # Inputs (keyword-only after sm): sm - boto3 SageMaker client; endpoint_name; config_name; tags.
+    # Outputs: none.
+    # Exceptions: client errors propagate.
+    # Side effects: AWS API call creating a billable endpoint; stderr logging.
     log(f"Creating endpoint: {endpoint_name}")
     sm.create_endpoint(
         EndpointName=endpoint_name,
@@ -129,6 +175,17 @@ def register_async_autoscaling(
     backlog_per_instance_target: int, scale_in_cooldown: int, scale_out_cooldown: int,
     wake_step_size: int, region: str,
 ) -> None:
+    # [FUNCTION DOC] Register backlog target tracking and a wake-from-zero step policy on a variant.
+    # Behavior: registers the variant's desired instance count as a scalable target with min/max;
+    #   puts "<endpoint>-backlog-target-tracking" tracking the average of
+    #   ApproximateBacklogSizePerInstance (endpoint dimension) at the target with the cooldowns;
+    #   puts "<endpoint>-step-wake-from-zero", a step policy adding wake_step_size instances for any
+    #   metric value at or above the alarm threshold, with the scale-out cooldown.
+    # Inputs (keyword-only): endpoint_name; variant_name; min_capacity; max_capacity;
+    #   backlog_per_instance_target; scale_in_cooldown; scale_out_cooldown; wake_step_size; region.
+    # Outputs: none.
+    # Exceptions: client errors propagate.
+    # Side effects: Application Auto Scaling API calls; stderr logging.
     """Register two autoscaling policies on the variant:
 
     1. Target-tracking on ApproximateBacklogSizePerInstance — handles
@@ -198,6 +255,17 @@ def create_async_alarms(
     *, endpoint_name: str, variant_name: str, sns_topic_arn: str | None,
     region: str, wake_alarm_arns_for_step_policy: list[str],
 ) -> None:
+    # [FUNCTION DOC] Create the async endpoint's CloudWatch alarms, including the wake-from-zero trigger.
+    # Behavior: puts "<endpoint>-ApproximateBacklogSize" (average above the backlog threshold) and
+    #   "<endpoint>-InvocationsFailed" (sum above the failure threshold), both notifying the SNS
+    #   topic if given; then "<endpoint>-HasBacklogWithoutCapacity" (average at or above 1 over one
+    #   60-second period) whose actions are the supplied step policy ARNs. Warns if no SNS topic.
+    # Inputs (keyword-only): endpoint_name; variant_name (unused); sns_topic_arn (or none); region;
+    #   wake_alarm_arns_for_step_policy - list of policy ARNs for the wake alarm (may be empty).
+    # Outputs: none.
+    # Exceptions: client errors propagate.
+    # Side effects: CloudWatch API calls; stderr logging.
+    # KNOWN ISSUE: variant_name is accepted but never used.
     """Create CloudWatch alarms for the async endpoint, including the
     HasBacklogWithoutCapacity alarm that drives the wake-from-zero policy.
     """
@@ -260,6 +328,13 @@ def create_async_alarms(
 
 
 def get_step_policy_arn(*, endpoint_name: str, variant_name: str, region: str) -> str:
+    # [FUNCTION DOC] HELPER: Look up the ARN of the wake-from-zero step-scaling policy.
+    # Behavior: describes scaling policies for the variant resource filtered to
+    #   "<endpoint>-step-wake-from-zero" and returns the first policy's ARN.
+    # Inputs (keyword-only): endpoint_name; variant_name; region.
+    # Outputs: the policy ARN string.
+    # Exceptions: raises a runtime error if no policy is found; client errors propagate.
+    # Side effects: Application Auto Scaling API call.
     """Look up the ARN of the step-scaling policy we just created.
 
     `put_scaling_policy` returns the ARN on creation but we don't capture it
@@ -278,6 +353,21 @@ def get_step_policy_arn(*, endpoint_name: str, variant_name: str, region: str) -
 
 
 def main() -> int:
+    # [FUNCTION DOC] Parse arguments and run the full async deployment; the script entry point.
+    # Behavior: 1) define and parse flags; 2) parse env pairs, compute endpoint and config names;
+    #   3) create clients and read the caller ARN; 4) exit with a message if min capacity is 0 and
+    #   autoscaling is disabled; 5) build tags with InferenceMode=async; 6) create model, async
+    #   config and endpoint, then wait for InService; 7) unless autoscaling is disabled, register
+    #   both policies and fetch the step policy ARN; 8) unless alarms are disabled, create alarms,
+    #   passing the step ARN (if any) to the wake alarm; 9) log a summary with an example async
+    #   invoke command and teardown command, and print the JSON summary.
+    # Inputs: none (reads the process command-line arguments).
+    # Outputs: returns 0; JSON on stdout; logs on stderr.
+    # Exceptions: raises a system exit for the invalid capacity combination; others propagate.
+    # Side effects: AWS API calls creating model, config, endpoint, scaling policies and alarms.
+    # KNOWN ISSUE: with min capacity 0 and --no-alarms, the HasBacklogWithoutCapacity alarm is never
+    #   created, so the endpoint can scale to zero and never wake up; this combination is not
+    #   rejected. The capacity check also runs only after AWS clients are created and STS is called.
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
     # Required

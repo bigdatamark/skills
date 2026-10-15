@@ -1,3 +1,17 @@
+# [MODULE DOC] CLI runner for lighteval evaluations on local GPU via vLLM or accelerate.
+# Behavior: parses CLI arguments and runs "lighteval vllm ..." or "lighteval accelerate ..."
+# as a subprocess for the given model and task specification.
+# The leading uv inline-script metadata comment block declares the Python version and deps.
+# CLI arguments: --model (required); --tasks (required, "suite|task|num_fewshot", comma
+# separated for several); --backend ("vllm" default or "accelerate"); --output-dir (optional);
+# --max-samples (int, optional); --batch-size (int, default 1); --tensor-parallel-size (int,
+# default 1, vllm only); --gpu-memory-utilization (float, default 0.8, vllm only); --dtype
+# (auto, float16, bfloat16, float32; default auto, mapped to bfloat16 for accelerate);
+# --trust-remote-code (flag); --use-chat-template (flag); --system-prompt (optional string).
+# Env vars: reads HF_TOKEN and defaults HUGGING_FACE_HUB_TOKEN and HF_HUB_TOKEN to it.
+# Top-level executed code: calls main when run as a script. Constants: none.
+# Outputs: prints the command and a completion message; exits with the subprocess exit code
+# on failure; result files are written by lighteval to the output directory if given.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -30,6 +44,13 @@ from typing import Optional
 
 
 def setup_environment() -> None:
+    # [FUNCTION DOC] HELPER: Mirror HF_TOKEN into the alternate Hugging Face token env var names.
+    # Behavior: if HF_TOKEN is set and non-empty, sets HUGGING_FACE_HUB_TOKEN and HF_HUB_TOKEN to
+    # its value only when they are not already set.
+    # Inputs: none.
+    # Outputs: none.
+    # Exceptions: none.
+    # Side effects: mutates the process environment variables.
     """Configure environment variables for HuggingFace authentication."""
     hf_token = os.getenv("HF_TOKEN")
     if hf_token:
@@ -50,6 +71,22 @@ def run_lighteval_vllm(
     use_chat_template: bool = False,
     system_prompt: Optional[str] = None,
 ) -> None:
+    # [FUNCTION DOC] Run lighteval with the vLLM backend.
+    # Behavior: 1) set up token env vars; 2) build "lighteval vllm <model_id> <tasks> --batch-size
+    # <n> --tensor-parallel-size <n> --gpu-memory-utilization <f> --dtype <dtype>"; 3) append
+    # --output-dir, --max-samples, --trust-remote-code, --use-chat-template and --system-prompt when
+    # set/truthy; 4) print and run the command.
+    # Inputs: model_id (string); tasks (string task spec); output_dir (optional string, default
+    # none); max_samples (optional int, default none); batch_size (int, default 1);
+    # tensor_parallel_size (int, default 1); gpu_memory_utilization (float, default 0.8); dtype
+    # (string, default "auto"); trust_remote_code (bool, default false); use_chat_template (bool,
+    # default false); system_prompt (optional string, default none).
+    # Outputs: prints the command and "Evaluation complete." on success; returns nothing.
+    # Exceptions: on a non-zero subprocess exit, prints the code to stderr and exits with it.
+    # Side effects: env var mutation, launches a subprocess (GPU work, downloads, result files).
+    # KNOWN ISSUE: recent lighteval CLIs take model settings as a single model-args string rather
+    # than separate flags such as batch-size, dtype and tensor-parallel-size, so this command may
+    # be rejected depending on the installed lighteval version.
     """
     Run lighteval with vLLM backend for efficient GPU inference.
 
@@ -116,6 +153,19 @@ def run_lighteval_accelerate(
     use_chat_template: bool = False,
     system_prompt: Optional[str] = None,
 ) -> None:
+    # [FUNCTION DOC] Run lighteval with the accelerate (Transformers) backend.
+    # Behavior: 1) set up token env vars; 2) build "lighteval accelerate <model_id> <tasks>
+    # --batch-size <n> --dtype <dtype>"; 3) append --output-dir, --max-samples,
+    # --trust-remote-code, --use-chat-template and --system-prompt when set/truthy; 4) print and
+    # run the command.
+    # Inputs: model_id (string); tasks (string); output_dir (optional string, default none);
+    # max_samples (optional int, default none); batch_size (int, default 1); dtype (string,
+    # default "bfloat16"); trust_remote_code (bool, default false); use_chat_template (bool,
+    # default false); system_prompt (optional string, default none).
+    # Outputs: prints the command and "Evaluation complete." on success; returns nothing.
+    # Exceptions: on a non-zero subprocess exit, prints the code to stderr and exits with it.
+    # Side effects: env var mutation, launches a subprocess (GPU work, downloads, result files).
+    # KNOWN ISSUE: same flag-style concern as the vLLM runner for recent lighteval versions.
     """
     Run lighteval with accelerate backend for multi-GPU distributed inference.
 
@@ -170,6 +220,14 @@ def run_lighteval_accelerate(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Parse CLI arguments and dispatch to the vLLM or accelerate lighteval runner.
+    # Behavior: defines the arguments listed in the module doc, parses them, and calls the vLLM
+    # runner when backend is "vllm"; otherwise calls the accelerate runner, replacing a dtype of
+    # "auto" with "bfloat16" and not forwarding the vLLM-only options.
+    # Inputs: none directly; reads command-line arguments.
+    # Outputs: none beyond what the runners print.
+    # Exceptions: argparse exits with code 2 on invalid arguments; runner exits propagate.
+    # Side effects: those of the called runner.
     parser = argparse.ArgumentParser(
         description="Run lighteval evaluations with vLLM or accelerate backend on custom HuggingFace models",
         formatter_class=argparse.RawDescriptionHelpFormatter,

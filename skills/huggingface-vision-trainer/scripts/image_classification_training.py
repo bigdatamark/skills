@@ -1,3 +1,20 @@
+# [MODULE DOC] Training script that fine-tunes any Transformers or timm image classification
+# model (via the auto image-classification model class) on a Hub dataset with the Trainer API.
+# Behavior: parses three argument groups (model, data, training) from the command line or from a
+# single JSON file, logs in to the Hub, starts Trackio tracking, loads the dataset, resolves the
+# label column and label names, remaps string labels to integer ids, shuffles and optionally
+# carves out a validation split, truncates, loads config/model/image processor, applies
+# torchvision transforms on the fly, trains, evaluates accuracy, and pushes to the Hub or writes
+# a model card. The comment block after this one is PEP 723 inline script metadata listing the
+# dependencies installed by "uv run".
+# CLI arguments: all fields of the model and data argument classes below plus every standard
+# Trainer training argument (output_dir, do_train, do_eval, push_to_hub, seed, etc.); a single
+# argument ending in ".json" is read as a JSON file of arguments instead.
+# Env vars: HF_TOKEN, or as a fallback "hfjob", supplies the Hub token used to log in and push.
+# Constants: logger - module logger.
+# Top-level executed code: verifies the installed Transformers version is at least 4.57.0.dev0
+# and datasets at least 2.0.0 (raising if not); runs main when executed as a script.
+# Side effects: network (Hub downloads, login, push, Trackio), files in the output directory.
 # /// script
 # dependencies = [
 #     "transformers>=5.2.0",
@@ -60,6 +77,13 @@ require_version("datasets>=2.0.0")
 
 @dataclass
 class DataTrainingArguments:
+    # [CLASS DOC] Dataclass of data-related command-line arguments for the classifier script.
+    # Behavior: plain field container parsed by the Hugging Face argument parser.
+    # Inputs: dataset_name (default "ethz/food101"); dataset_config_name (default none);
+    # train_val_split (default 0.15, fraction of train used for validation when no validation split
+    # exists); max_train_samples and max_eval_samples (default none, truncation limits);
+    # image_column_name (default "image"); label_column_name (default "label").
+    # Outputs: none. Exceptions: none. Side effects: none.
     dataset_name: str = field(
         default="ethz/food101",
         metadata={"help": "Name of a dataset from the Hub."},
@@ -92,6 +116,13 @@ class DataTrainingArguments:
 
 @dataclass
 class ModelArguments:
+    # [CLASS DOC] Dataclass of model-related command-line arguments for the classifier script.
+    # Behavior: plain field container parsed by the Hugging Face argument parser.
+    # Inputs: model_name_or_path (default "timm/mobilenetv3_small_100.lamb_in1k"); config_name and
+    # image_processor_name (default none, fall back to the model id); cache_dir (default none);
+    # model_revision (default "main"); ignore_mismatched_sizes (default true, allows a new
+    # classification head size); token (default none); trust_remote_code (default false).
+    # Outputs: none. Exceptions: none. Side effects: none.
     model_name_or_path: str = field(
         default="timm/mobilenetv3_small_100.lamb_in1k",
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."},
@@ -127,6 +158,16 @@ class ModelArguments:
 
 
 def build_transforms(image_processor, is_training: bool):
+    # [FUNCTION DOC] HELPER: Build torchvision train or eval transforms from an image processor.
+    # Behavior: derives the target size from the processor's size setting (shortest_edge as an
+    # integer, else a height/width pair, else 224; 224 when no size attribute). Uses the processor's
+    # mean/std for normalization when available, else ImageNet statistics. Training pipeline: random
+    # resized crop to the size, random horizontal flip, conversion to tensor, normalization. Eval
+    # pipeline: resize to size divided by 0.875, center crop to the size, tensor, normalization.
+    # Inputs: image_processor (a Transformers image processor); is_training (bool).
+    # Outputs: a composed torchvision transform that maps a PIL image to a normalized tensor.
+    # Exceptions: none deliberately.
+    # Side effects: none.
     """Build torchvision transforms from the image processor's config."""
     if hasattr(image_processor, "size"):
         size = image_processor.size
@@ -165,6 +206,38 @@ def build_transforms(image_processor, is_training: bool):
 
 
 def main():
+    # [FUNCTION DOC] Entry point: run the full image classification fine-tuning pipeline.
+    # Behavior:
+    #   1. Parse model/data/training arguments (from a JSON file if it is the only argument).
+    #   2. If HF_TOKEN or "hfjob" is set, log in and store the token as the hub token; otherwise warn
+    #      when pushing is requested. Start a Trackio run named after the run name, with the output
+    #      directory as project. Configure logging levels.
+    #   3. Load the dataset. If the requested label column is missing from train, use the first of
+    #      label/labels/class/fine_label, else raise a value error listing the columns.
+    #   4. Label names come from the ClassLabel feature, or the sorted unique train values (converted
+    #      to text when not all strings). Build id-to-label and label-to-id mappings.
+    #   5. If the first train label is a string, map every split's labels to integer ids.
+    #   6. Shuffle train with the seed; if no validation split exists and the split fraction is
+    #      positive, split train into train/validation. Apply max train/eval sample truncation.
+    #   7. Load config (with label count and mappings), model (allowing mismatched head sizes) and
+    #      image processor; attach lazy train/eval transforms to train, validation and test splits.
+    #   8. Build a Trainer with an accuracy metric (argmax of logits), the default collator, and an
+    #      eval dataset of validation (else test) when evaluating. Train if requested (save model,
+    #      metrics, state); if evaluating, evaluate on test if present else validation with prefix
+    #      "test" or "eval" and save metrics. Finish Trackio.
+    #   9. Push to the Hub with finetuned_from, dataset and tags if requested, else write a model card.
+    # Inputs: none directly (CLI arguments / JSON file and env vars).
+    # Outputs: trained model, processor, metrics JSON files, trainer state and model card in the
+    # output directory; optionally a Hub repository.
+    # Exceptions: raises a value error when no usable label column exists; errors from loading,
+    # training or pushing propagate.
+    # Side effects: Hub login and network access, Trackio logging, global logging configuration,
+    # filesystem writes.
+    # KNOWN ISSUE: when labels are integers without ClassLabel metadata, label ids are positions in
+    # the sorted unique values but the data keeps the raw integers, so non-contiguous integer labels
+    # (for example 1..N or gaps) do not match the model's label indices.
+    # KNOWN ISSUE: trust_remote_code is passed to dataset loading although the pinned datasets 4.x no
+    # longer supports dataset loading scripts; this may warn or error.
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
@@ -306,12 +379,24 @@ def main():
     image_col = data_args.image_column_name
 
     def preprocess_train(examples):
+        # [FUNCTION DOC] HELPER: Batch transform for training examples (applied lazily by the dataset).
+        # Behavior: converts each image in the batch to RGB, applies the training transforms, and
+        # returns them together with the batch's labels.
+        # Inputs: examples (mapping of column name to list of values for one batch); uses the enclosing
+        # image and label column names and training transforms.
+        # Outputs: a mapping with "pixel_values" (list of tensors) and "labels" (list of ints).
+        # Exceptions: none deliberately. Side effects: none.
         return {
             "pixel_values": [train_transforms(img.convert("RGB")) for img in examples[image_col]],
             "labels": examples[label_col],
         }
 
     def preprocess_val(examples):
+        # [FUNCTION DOC] HELPER: Batch transform for validation/test examples (applied lazily).
+        # Behavior: same as the training transform but uses the deterministic eval transforms.
+        # Inputs: examples (mapping of column name to list of values for one batch).
+        # Outputs: a mapping with "pixel_values" (list of tensors) and "labels" (list of ints).
+        # Exceptions: none deliberately. Side effects: none.
         return {
             "pixel_values": [val_transforms(img.convert("RGB")) for img in examples[image_col]],
             "labels": examples[label_col],
@@ -327,6 +412,12 @@ def main():
     accuracy_metric = evaluate.load("accuracy")
 
     def compute_metrics(eval_pred: EvalPrediction):
+        # [FUNCTION DOC] HELPER: Compute top-1 accuracy for the Trainer's evaluation loop.
+        # Behavior: takes the argmax of the prediction logits along the class axis and compares with
+        # the reference label ids using the "accuracy" metric from the evaluate library.
+        # Inputs: eval_pred (evaluation prediction with predictions and label_ids arrays).
+        # Outputs: a mapping with key "accuracy" and a float value.
+        # Exceptions: none deliberately. Side effects: none.
         predictions = np.argmax(eval_pred.predictions, axis=1)
         return accuracy_metric.compute(predictions=predictions, references=eval_pred.label_ids)
 

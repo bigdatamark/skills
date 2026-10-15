@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# [MODULE DOC] CLI script that creates a SageMaker execution IAM role with a trust policy and an
+# inline minimum-permissions policy, using the aws CLI from the current shell.
+# Behavior: refuses if the role already exists, warns for SSO callers, creates the role from
+#   references/trust-policy.json, attaches references/minimum-permissions.json as the inline
+#   policy "SageMakerDeploymentMinimum" (substituting the model bucket placeholder when a bucket
+#   is given), then prints the new role's ARN.
+# CLI arguments: required role name; optional S3 bucket name for model artifacts.
+# Env vars: none read directly; aws subprocesses inherit the shell's AWS configuration.
+# Constants: REFERENCES - the skill's references directory; TRUST_POLICY and
+#   PERMISSIONS_TEMPLATE - JSON policy files inside it.
+# Top-level executed code: path constants are computed at import; the main-guard runs main and
+#   exits with its return code.
+# Outputs: role ARN on stdout; logs on stderr. Exit codes: 0 created, 1 role exists or an aws
+#   command failed, 2 aws CLI missing, 64 usage error.
 """Create a SageMaker execution role. Cross-platform (Windows/macOS/Linux).
 
 Run only after check_role.py confirms no usable role exists.
@@ -33,10 +47,22 @@ PERMISSIONS_TEMPLATE = REFERENCES / "minimum-permissions.json"
 
 
 def log(msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Write a "[create_role]"-prefixed message to stderr.
+    # Behavior: prints the prefixed message to stderr and flushes.
+    # Inputs: msg - text to log.
+    # Outputs: none returned; one stderr line.
+    # Exceptions: none.
+    # Side effects: writes to stderr.
     print(f"[create_role] {msg}", file=sys.stderr, flush=True)
 
 
 def aws_bin() -> str:
+    # [FUNCTION DOC] HELPER: Resolve the aws CLI executable path or exit.
+    # Behavior: looks up "aws" on PATH; if absent logs an error and exits the process with code 2.
+    # Inputs: none.
+    # Outputs: the aws executable path.
+    # Exceptions: terminates via system exit (code 2) when not found.
+    # Side effects: PATH lookup; stderr logging; may exit the process.
     exe = shutil.which("aws")
     if not exe:
         log("ERROR: the 'aws' CLI was not found on PATH. Install AWS CLI v2.")
@@ -45,6 +71,14 @@ def aws_bin() -> str:
 
 
 def run_aws(args: list[str], check: bool = False) -> subprocess.CompletedProcess:
+    # [FUNCTION DOC] HELPER: Run an aws CLI command, optionally exiting on failure.
+    # Behavior: runs aws with the arguments, capturing text output; if check is true and the exit
+    #   code is nonzero, logs the command and its stderr and exits the process with code 1.
+    # Inputs: args - CLI argument strings after "aws"; check - exit on failure when true
+    #   (default false).
+    # Outputs: the completed-process result.
+    # Exceptions: terminates via system exit (code 1) on checked failure; aws_bin may exit (code 2).
+    # Side effects: spawns an aws subprocess (AWS API calls); stderr logging.
     proc = subprocess.run([aws_bin(), *args], capture_output=True, text=True)
     if check and proc.returncode != 0:
         log(f"AWS command failed: aws {' '.join(args)}")
@@ -55,6 +89,20 @@ def run_aws(args: list[str], check: bool = False) -> subprocess.CompletedProcess
 
 
 def main() -> int:
+    # [FUNCTION DOC] Create the role and attach its inline policy; the script entry point.
+    # Behavior: 1) require a role name (return 64 with usage otherwise); optional bucket argument;
+    #   2) if "iam get-role" succeeds, report it exists and return 1; 3) get the caller ARN (checked)
+    #   and warn if it is an AWS SSO reserved role; 4) read the trust policy file and run
+    #   "iam create-role" with it inline (checked); 5) read the permissions template, replace
+    #   REPLACE_WITH_MODEL_BUCKET with the bucket if given (else warn about the placeholder);
+    #   6) run "iam put-role-policy" (checked); 7) fetch the role ARN (checked), log and print it.
+    # Inputs: none (reads the process command-line arguments).
+    # Outputs: returns 0, 1 or 64; ARN on stdout; logs on stderr.
+    # Exceptions: none caught; file read errors propagate; checked aws failures exit with code 1.
+    # Side effects: reads policy files; creates an IAM role and inline policy in the AWS account.
+    # KNOWN ISSUE: any get-role failure (including AccessDenied or network errors) is treated as
+    #   "role does not exist", and if put-role-policy fails after create-role the role is left
+    #   half-configured with no rollback.
     if len(sys.argv) < 2:
         log(f"Usage: {Path(sys.argv[0]).name} <role-name> [<model-s3-bucket>]")
         return 64

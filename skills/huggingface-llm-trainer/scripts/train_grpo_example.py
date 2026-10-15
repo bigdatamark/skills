@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Example script: GRPO online RL training of Qwen2.5-0.5B-Instruct with TRL.
+# Behavior (top-level, no functions): loads trl-lib/math_shepherd (train split), builds a GRPO
+# config (output dir "qwen-grpo-math", push to Hub repo "username/qwen-grpo-math" on every
+# save, 1 epoch, batch 4 with 4 accumulation steps, LR 1e-6, logging every 10 steps, save every
+# 100 steps keeping 2, 10% warmup, cosine schedule, Trackio reporting with placeholder
+# project/run names), trains, pushes to the Hub and prints links.
+# CLI arguments: none. Env vars: Hub token (e.g. HF_TOKEN) is used implicitly for pushing.
+# Constants: hard-coded dataset, model and placeholder "username" repo IDs.
+# Outputs: progress prints; checkpoints in the output directory; model pushed to the Hub.
+# Side effects: network downloads/uploads, GPU training, filesystem writes, Trackio logging.
+# KNOWN ISSUE: no reward functions are passed to the GRPO trainer, which requires them, so
+# the trainer construction is expected to fail.
+# KNOWN ISSUE: unlike the DPO/SFT examples, Trackio tracking is never finished although the
+# module is imported; "datasets" is imported but not declared as a dependency.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [

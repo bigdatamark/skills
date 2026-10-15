@@ -1,3 +1,17 @@
+# [MODULE DOC] CLI runner for inspect-ai evaluations on local GPU via vLLM or HF Transformers.
+# Behavior: parses CLI arguments and, depending on --backend, builds and runs an external
+# "inspect eval" command with model spec "vllm/<model>" or "hf/<model>" as a subprocess.
+# The leading uv inline-script metadata comment block declares the Python version and deps.
+# CLI arguments: --model (required); --task (required); --backend ("vllm" default or "hf");
+# --limit (int, optional); --max-connections (int; default 4 for vllm, 1 for hf);
+# --temperature (float; default 0.0 for vllm, 0.001 for hf); --tensor-parallel-size (int,
+# default 1, vllm only); --gpu-memory-utilization (float, default 0.8, vllm only); --dtype
+# (auto, float16, bfloat16, float32; default auto); --device (default auto, hf only);
+# --trust-remote-code (flag); --log-level (debug, info, warning, error; default info).
+# Env vars: reads HF_TOKEN and defaults HUGGING_FACE_HUB_TOKEN and HF_HUB_TOKEN to it.
+# Top-level executed code: calls main when run as a script. Constants: none.
+# Outputs: prints the command and a completion message; exits with the subprocess exit code
+# on failure.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -33,6 +47,13 @@ from typing import Optional
 
 
 def setup_environment() -> None:
+    # [FUNCTION DOC] HELPER: Mirror HF_TOKEN into the alternate Hugging Face token env var names.
+    # Behavior: if HF_TOKEN is set and non-empty, sets HUGGING_FACE_HUB_TOKEN and HF_HUB_TOKEN to
+    # its value only when they are not already set.
+    # Inputs: none.
+    # Outputs: none.
+    # Exceptions: none.
+    # Side effects: mutates the process environment variables.
     """Configure environment variables for HuggingFace authentication."""
     hf_token = os.getenv("HF_TOKEN")
     if hf_token:
@@ -52,6 +73,25 @@ def run_inspect_vllm(
     trust_remote_code: bool = False,
     log_level: str = "info",
 ) -> None:
+    # [FUNCTION DOC] Run an inspect-ai evaluation using the vLLM model backend.
+    # Behavior: 1) set up token env vars; 2) build "inspect eval <task> --model vllm/<model_id>
+    # --log-level <log_level> --max-connections <n> --temperature <t>"; 3) append
+    # --tensor-parallel-size if not 1, --gpu-memory-utilization if not 0.8, --dtype if not "auto",
+    # --trust-remote-code if enabled, --limit if truthy; 4) print and run the command.
+    # Inputs: model_id (string, Hub ID); task (string, inspect task); limit (optional int, sample
+    # cap, default none); max_connections (int, default 4); temperature (float, default 0.0);
+    # tensor_parallel_size (int, default 1); gpu_memory_utilization (float, default 0.8);
+    # dtype (string, default "auto"); trust_remote_code (bool, default false);
+    # log_level (string, default "info").
+    # Outputs: prints "Running: <command>" and "Evaluation complete." on success; returns nothing.
+    # Exceptions: on a non-zero subprocess exit, prints the code to stderr and exits the process
+    # with that code.
+    # Side effects: env var mutation, launches a subprocess (GPU work, model downloads).
+    # KNOWN ISSUE: tensor-parallel-size, gpu-memory-utilization, dtype and trust-remote-code are
+    # passed as top-level "inspect eval" flags, which inspect-ai does not define (model options go
+    # through model args), so non-default values likely make the command fail; the nearby comment
+    # even says model args are not used.
+    # KNOWN ISSUE: a limit of 0 is treated as no limit.
     """
     Run inspect-ai evaluation with vLLM backend.
 
@@ -120,6 +160,20 @@ def run_inspect_hf(
     trust_remote_code: bool = False,
     log_level: str = "info",
 ) -> None:
+    # [FUNCTION DOC] Run an inspect-ai evaluation using the Hugging Face Transformers backend.
+    # Behavior: 1) set up token env vars; 2) build "inspect eval <task> --model hf/<model_id>
+    # --log-level <log_level> --max-connections <n> --temperature <t>"; 3) append --device if not
+    # "auto", --dtype if not "auto", --trust-remote-code if enabled, --limit if truthy;
+    # 4) print and run the command.
+    # Inputs: model_id (string); task (string); limit (optional int, default none);
+    # max_connections (int, default 1); temperature (float, default 0.001); device (string,
+    # default "auto"); dtype (string, default "auto"); trust_remote_code (bool, default false);
+    # log_level (string, default "info").
+    # Outputs: prints the command and "Evaluation complete." on success; returns nothing.
+    # Exceptions: on a non-zero subprocess exit, prints the code to stderr and exits with it.
+    # Side effects: env var mutation, launches a subprocess (model downloads, GPU/CPU work).
+    # KNOWN ISSUE: device, dtype and trust-remote-code are passed as top-level "inspect eval"
+    # flags that inspect-ai does not define, so non-default values likely fail.
     """
     Run inspect-ai evaluation with HuggingFace Transformers backend.
 
@@ -175,6 +229,16 @@ def run_inspect_hf(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Parse CLI arguments and dispatch to the vLLM or HF evaluation runner.
+    # Behavior: defines the arguments listed in the module doc, parses them, and calls the vLLM
+    # runner when backend is "vllm" (max connections defaulting to 4, temperature to 0.0) or the
+    # HF runner otherwise (max connections defaulting to 1, temperature to 0.001), forwarding the
+    # remaining options relevant to each backend.
+    # Inputs: none directly; reads command-line arguments.
+    # Outputs: none beyond what the runners print.
+    # Exceptions: argparse exits with code 2 on invalid arguments; runner exits propagate.
+    # Side effects: those of the called runner.
+    # KNOWN ISSUE: a --max-connections of 0 is silently replaced by the backend default.
     parser = argparse.ArgumentParser(
         description="Run inspect-ai evaluations with vLLM or HuggingFace Transformers on custom models",
         formatter_class=argparse.RawDescriptionHelpFormatter,

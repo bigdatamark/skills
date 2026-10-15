@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# [MODULE DOC] CLI that inspects a Hub dataset via the Datasets Server API and reports its
+# compatibility with TRL training methods (SFT, DPO, GRPO, KTO), plus suggested mapping code.
+# Behavior: fetches split metadata and the first rows of a split over HTTPS (no dataset
+# download), derives column names from the first row, runs heuristic compatibility checks and
+# prints either a human-readable report or a JSON document.
+# CLI arguments: --dataset (required, dataset ID); --split (default "train"); --config
+# (default "default"); --preview (int, max chars per field preview, default 150); --samples
+# (int, rows to fetch, default 5); --json-output (flag, print JSON instead of text).
+# Env vars: none. Constants: none (API base URL is inlined in helper functions).
+# Top-level executed code: when run as a script, calls main; a keyboard interrupt exits 0 and
+# any other uncaught exception is printed to stderr with exit code 1.
+# Outputs: report on stdout; exit code 0 on success, 1 on errors.
+# Side effects: network requests to datasets-server.huggingface.co.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = []
@@ -27,6 +40,13 @@ from typing import List, Dict, Any
 
 
 def parse_args():
+    # [FUNCTION DOC] HELPER: Define and parse the command-line arguments.
+    # Behavior: builds an argument parser with the options listed in the module doc and parses
+    # the process arguments.
+    # Inputs: none (reads command-line arguments).
+    # Outputs: the parsed arguments namespace.
+    # Exceptions: argparse exits with code 2 on invalid arguments.
+    # Side effects: none beyond reading the command line.
     parser = argparse.ArgumentParser(description="Inspect dataset format for TRL training")
     parser.add_argument("--dataset", type=str, required=True, help="Dataset name")
     parser.add_argument("--split", type=str, default="train", help="Dataset split (default: train)")
@@ -38,6 +58,15 @@ def parse_args():
 
 
 def api_request(url: str) -> Dict:
+    # [FUNCTION DOC] HELPER: GET a Datasets Server URL and decode the JSON body.
+    # Behavior: opens the URL with a 10 second timeout, reads and decodes the body as JSON.
+    # Inputs: url (string) - full request URL.
+    # Outputs: the decoded JSON object (mapping), or nothing (None) on HTTP 404.
+    # Exceptions: other HTTP errors are re-raised as a generic exception with code and reason;
+    # any other error (network, JSON decode) is re-raised as a generic exception with its message.
+    # Side effects: network request.
+    # KNOWN ISSUE: the non-404 HTTP error message is re-wrapped by the outer generic handler,
+    # giving a doubled "API request failed" prefix; the return annotation omits the None case.
     """Make API request to Datasets Server"""
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
@@ -51,23 +80,55 @@ def api_request(url: str) -> Dict:
 
 
 def get_splits(dataset: str) -> Dict:
+    # [FUNCTION DOC] HELPER: Fetch the list of configs/splits for a dataset.
+    # Behavior: builds the Datasets Server "splits" URL with the URL-encoded dataset name and
+    # delegates to the API request helper.
+    # Inputs: dataset (string) - dataset ID.
+    # Outputs: decoded JSON mapping (expected to contain "splits"), or nothing on 404.
+    # Exceptions: propagates errors from the request helper.
+    # Side effects: network request.
     """Get available splits for dataset"""
     url = f"https://datasets-server.huggingface.co/splits?dataset={urllib.parse.quote(dataset)}"
     return api_request(url)
 
 
 def get_rows(dataset: str, config: str, split: str, offset: int = 0, length: int = 5) -> Dict:
+    # [FUNCTION DOC] HELPER: Fetch a window of rows from a dataset split.
+    # Behavior: builds the Datasets Server "rows" URL from dataset (URL-encoded), config, split,
+    # offset and length, and delegates to the API request helper.
+    # Inputs: dataset (string); config (string); split (string); offset (int, default 0);
+    # length (int, default 5).
+    # Outputs: decoded JSON mapping (expected keys "rows" and "features"), or nothing on 404.
+    # Exceptions: propagates errors from the request helper.
+    # Side effects: network request.
+    # KNOWN ISSUE: config and split are inserted without URL-encoding.
     """Get rows from dataset"""
     url = f"https://datasets-server.huggingface.co/rows?dataset={urllib.parse.quote(dataset)}&config={config}&split={split}&offset={offset}&length={length}"
     return api_request(url)
 
 
 def find_columns(columns: List[str], patterns: List[str]) -> List[str]:
+    # [FUNCTION DOC] HELPER: Return columns whose lowercased name contains any of the patterns.
+    # Behavior: keeps the original order of columns, case-insensitive substring match.
+    # Inputs: columns (list of strings); patterns (list of lowercase substrings).
+    # Outputs: list of matching column names.
+    # Exceptions: none.
+    # Side effects: none.
     """Find columns matching patterns"""
     return [c for c in columns if any(p in c.lower() for p in patterns)]
 
 
 def check_sft_compatibility(columns: List[str]) -> Dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Assess whether the columns suit supervised fine-tuning.
+    # Behavior: ready if a "messages" column, a "text" column, or both "prompt" and "completion"
+    # exist; reason names the first matching form in that order. Also guesses the first column
+    # resembling a prompt (prompt/instruction/question/input) and a response
+    # (response/completion/output/answer), and notes whether a "context" column exists.
+    # Inputs: columns (list of strings).
+    # Outputs: mapping with ready (bool), reason (string or none), possible_prompt,
+    # possible_response (string or none) and has_context (bool).
+    # Exceptions: none.
+    # Side effects: none.
     """Check SFT compatibility"""
     has_messages = "messages" in columns
     has_text = "text" in columns
@@ -88,6 +149,14 @@ def check_sft_compatibility(columns: List[str]) -> Dict[str, Any]:
 
 
 def check_dpo_compatibility(columns: List[str]) -> Dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Assess whether the columns suit DPO preference training.
+    # Behavior: ready if "prompt", "chosen" and "rejected" columns all exist; guesses prompt,
+    # chosen (chosen/preferred/winner) and rejected (rejected/dispreferred/loser) columns by
+    # substring and marks can_map when all three guesses exist.
+    # Inputs: columns (list of strings).
+    # Outputs: mapping with ready, can_map (bools) and prompt_col, chosen_col, rejected_col.
+    # Exceptions: none.
+    # Side effects: none.
     """Check DPO compatibility"""
     has_standard = "prompt" in columns and "chosen" in columns and "rejected" in columns
     
@@ -107,6 +176,13 @@ def check_dpo_compatibility(columns: List[str]) -> Dict[str, Any]:
 
 
 def check_grpo_compatibility(columns: List[str]) -> Dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Assess whether the columns suit GRPO (prompt-only) training.
+    # Behavior: ready if a "prompt" column exists and neither "chosen" nor "rejected" exists;
+    # can_map if some prompt-like column exists and there are no chosen/rejected columns.
+    # Inputs: columns (list of strings).
+    # Outputs: mapping with ready, can_map (bools) and prompt_col (string or none).
+    # Exceptions: none.
+    # Side effects: none.
     """Check GRPO compatibility"""
     has_prompt = "prompt" in columns
     has_no_responses = "chosen" not in columns and "rejected" not in columns
@@ -121,11 +197,33 @@ def check_grpo_compatibility(columns: List[str]) -> Dict[str, Any]:
 
 
 def check_kto_compatibility(columns: List[str]) -> Dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Assess whether the columns suit KTO training.
+    # Behavior: ready only if "prompt", "completion" and "label" columns all exist.
+    # Inputs: columns (list of strings).
+    # Outputs: mapping with a single ready boolean.
+    # Exceptions: none.
+    # Side effects: none.
     """Check KTO compatibility"""
     return {"ready": "prompt" in columns and "completion" in columns and "label" in columns}
 
 
 def generate_mapping_code(method: str, info: Dict[str, Any]) -> str:
+    # [FUNCTION DOC] HELPER: Produce Python source text that maps a dataset to a method's format.
+    # Behavior: for "SFT": nothing if ready or no prompt-like column; otherwise a snippet that
+    # builds a "text" field from instruction, optional context and response columns (if a
+    # context column and response exist), from prompt and response joined by a blank line (if
+    # only a response exists), or from the prompt alone. For "DPO"/"GRPO": nothing if ready or not
+    # mappable; otherwise a snippet renaming the detected columns to prompt/chosen/rejected or to
+    # prompt. Each snippet ends with a dataset map call removing the original columns.
+    # Inputs: method (string: "SFT", "DPO" or "GRPO"); info (mapping from the matching
+    # compatibility check).
+    # Outputs: the snippet as a string, or nothing (None) when no mapping is needed/possible or
+    # the method is unknown.
+    # Exceptions: none expected.
+    # Side effects: none.
+    # KNOWN ISSUE: the newline escapes inside the generating f-strings become real line breaks
+    # within single-quoted string literals of the emitted snippet, so the printed SFT code is not
+    # valid Python as shown.
     """Generate mapping code for a training method"""
     if method == "SFT":
         if info["ready"]:
@@ -184,6 +282,14 @@ dataset = dataset.map(format_for_grpo, remove_columns=dataset.column_names)"""
 
 
 def format_value_preview(value: Any, max_chars: int) -> str:
+    # [FUNCTION DOC] HELPER: Render a field value as a short preview string.
+    # Behavior: none-values become "None"; strings are truncated to max_chars with "..." added
+    # when cut; lists of mappings are summarised as item count plus the first item's keys; other
+    # lists and values are stringified and truncated the same way.
+    # Inputs: value (any); max_chars (int) - truncation length.
+    # Outputs: preview string.
+    # Exceptions: none.
+    # Side effects: none.
     """Format value for preview"""
     if value is None:
         return "None"
@@ -200,6 +306,23 @@ def format_value_preview(value: Any, max_chars: int) -> str:
 
 
 def main():
+    # [FUNCTION DOC] Fetch dataset metadata/rows, run compatibility checks and print the report.
+    # Behavior: 1) parse arguments; 2) fetch splits, exiting 1 if missing; 3) collect configs and
+    # check that the requested config/split pair exists, otherwise switch to an arbitrary
+    # available config; 4) fetch the first rows, exiting 1 if missing or empty; 5) take columns
+    # from the first row, features from the response and the split's example count (formatted with
+    # thousands separators, else "Unknown"); any exception in steps 2-5 prints an error and exits
+    # 1; 6) run the SFT/DPO/GRPO/KTO checks and build the recommended method list (with "(needs
+    # mapping)" suffixes); 7) with JSON output print a JSON document (dataset, config, split,
+    # total_examples, columns, features, compatibility, recommended_methods) and exit 0;
+    # 8) otherwise print sections for columns/types, first-row previews, per-method status,
+    # mapping snippets (or a no-mapping message) and a summary, then exit 0.
+    # Inputs: none directly; reads command-line arguments.
+    # Outputs: report on stdout; exit code 0 on success, 1 on fetch errors.
+    # Exceptions: catches all exceptions during fetching (prints and exits 1).
+    # Side effects: network requests; terminates the process via exit.
+    # KNOWN ISSUE: the fallback config is taken from an unordered set, so the choice is arbitrary
+    # and the requested split is not verified to exist in it.
     args = parse_args()
     
     print(f"Fetching dataset info via Datasets Server API...")

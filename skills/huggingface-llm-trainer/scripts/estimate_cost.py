@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# [MODULE DOC] CLI that gives a rough estimate of TRL training time and cost on HF Jobs
+# hardware and prints a suggested job configuration.
+# Behavior: parses arguments, infers model size in billions of parameters from the model
+# string, picks a dataset size, estimates hours and cost, and prints warnings and an example
+# job snippet with a 30% timeout buffer.
+# CLI arguments: --model (required, name or size like "0.5B"); --dataset (required);
+# --hardware (required, one of the hardware cost keys); --dataset-size (int, optional
+# override); --epochs (int, default 3).
+# Constants: HARDWARE_COSTS - mapping from hardware flavor to approximate USD per hour;
+# MODEL_SIZES - mapping from size substring to billions of parameters.
+# Env vars: none. Top-level executed code: calls main when run as a script.
+# Outputs: estimates and recommendations printed to stdout. Side effects: none other.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = []
@@ -37,6 +49,16 @@ MODEL_SIZES = {
 }
 
 def estimate_training_time(model_params, dataset_size, epochs, hardware):
+    # [FUNCTION DOC] HELPER: Estimate training hours from model size, data size, epochs, hardware.
+    # Behavior: hours = 0.1 times model size (billions) times examples per thousand times epochs,
+    # then multiplied by a hardware factor relative to a10g-large (t4-small 2.0, t4-medium 1.5,
+    # l4x1 1.2, a10g-small 1.3, a10g-large 1.0, a10g-largex2 0.6, a10g-largex4 0.4, a100-large
+    # 0.7; unknown flavors 1.0).
+    # Inputs: model_params (number, billions); dataset_size (int examples); epochs (int);
+    # hardware (string flavor).
+    # Outputs: estimated hours as a float.
+    # Exceptions: none.
+    # Side effects: none.
     """Estimate training time in hours."""
     # Rough estimates based on empirical observations
     # These are approximations and actual times will vary
@@ -64,6 +86,11 @@ def estimate_training_time(model_params, dataset_size, epochs, hardware):
     return time
 
 def parse_args():
+    # [FUNCTION DOC] HELPER: Define and parse the command-line arguments (see module doc).
+    # Inputs: none (reads command-line arguments).
+    # Outputs: the parsed arguments namespace.
+    # Exceptions: argparse exits with code 2 on invalid arguments or unknown hardware.
+    # Side effects: none.
     parser = argparse.ArgumentParser(description="Estimate training cost for TRL jobs")
     parser.add_argument("--model", required=True, help="Model name or size (e.g., 'Qwen/Qwen2.5-0.5B' or '0.5B')")
     parser.add_argument("--dataset", required=True, help="Dataset name")
@@ -73,6 +100,17 @@ def parse_args():
     return parser.parse_args()
 
 def extract_model_size(model_name):
+    # [FUNCTION DOC] HELPER: Infer a model's parameter count (billions) from its name.
+    # Behavior: returns the value of the first size key (in table order) found as a substring of
+    # the name; otherwise, if the name contains "B", tries to parse the name with all "B"
+    # characters removed as a number; otherwise or on parse failure returns 1.0.
+    # Inputs: model_name (string).
+    # Outputs: number of billions of parameters.
+    # Exceptions: parse errors are caught by a bare handler and swallowed.
+    # Side effects: none.
+    # KNOWN ISSUE: substring matching misreads sizes, e.g. "13B" contains "3B" and returns 3;
+    # full repo names like "org/Model-70B" fail the numeric parse and fall back to 1.0.
+    # KNOWN ISSUE: the bare exception handler also swallows unrelated errors.
     """Extract model size from name or return parsed value."""
     for size_str, size_val in MODEL_SIZES.items():
         if size_str in model_name:
@@ -88,6 +126,18 @@ def extract_model_size(model_name):
     return 1.0  # Default to 1B if can't determine
 
 def main():
+    # [FUNCTION DOC] Compute and print the time/cost estimate and an example job configuration.
+    # Behavior: 1) parse arguments; 2) infer model size; 3) use --dataset-size if given, else a
+    # built-in size for two known datasets or 10000; 4) estimate hours and cost (hours times the
+    # hourly rate); 5) recommended timeout is hours times 1.3; 6) print the estimates; 7) warn if
+    # over 4 hours, and if the model is 7B or larger on non-multi-GPU/non-A100 hardware;
+    # 8) print an example hf_jobs configuration using the hardware and rounded timeout.
+    # Inputs: none directly; reads command-line arguments.
+    # Outputs: text printed to stdout; returns nothing.
+    # Exceptions: none handled.
+    # Side effects: printing only.
+    # KNOWN ISSUE: a --dataset-size of 0 is ignored (treated as unset); short jobs round the
+    # suggested timeout to "0h".
     args = parse_args()
     
     # Extract model parameters

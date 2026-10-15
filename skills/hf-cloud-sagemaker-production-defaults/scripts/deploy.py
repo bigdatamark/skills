@@ -1,4 +1,24 @@
 #!/usr/bin/env python
+# [MODULE DOC] CLI script that deploys a SageMaker real-time endpoint with production defaults using boto3.
+# Behavior: parses flags, creates (or reuses) the model, creates (or reuses) an endpoint config
+#   with one "AllTraffic" variant (optional inference AMI version and data capture), creates the
+#   endpoint and waits for InService, then registers target-tracking autoscaling and three
+#   CloudWatch alarms unless disabled, logs a human summary and prints a JSON summary.
+# CLI arguments: required --model-name, --image-uri, --role-arn, --instance-type, --region;
+#   optional --model-s3-uri, repeatable --env KEY=VALUE, --inference-ami-version,
+#   --endpoint-name (default model name plus UTC timestamp), --project (default model name),
+#   --environment (default "dev"), --initial-instance-count, --min-capacity, --max-capacity,
+#   --target-invocations-per-instance, --no-autoscaling, --enable-data-capture,
+#   --data-capture-s3-uri (default the account's sagemaker-<region>-<account> bucket),
+#   --sns-alarm-topic, --no-alarms.
+# Env vars: none read directly; boto3 uses the standard AWS credential chain.
+# Constants: DEFAULTS - mapping of default capacities, scaling cooldowns, data-capture sampling,
+#   alarm thresholds/periods and the environment tag.
+# Top-level executed code: imports helpers from the sibling _common module (so it must be run
+#   from, or with, its scripts directory on the import path); the main-guard runs main.
+# Outputs: progress on stderr; one JSON line on stdout (endpoint, config, model, region,
+#   instance type); exit code 0 on success, nonzero via uncaught exceptions or argparse errors.
+# KNOWN ISSUE: the "time" import is unused.
 """Create a SageMaker real-time endpoint with production defaults.
 
 Minimal usage:
@@ -48,6 +68,12 @@ DEFAULTS = {
 
 
 def log(msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Log a message to stderr with the "deploy" prefix.
+    # Behavior: delegates to the shared logger with prefix "deploy".
+    # Inputs: msg - text.
+    # Outputs: none returned; one stderr line.
+    # Exceptions: none.
+    # Side effects: writes to stderr.
     _log("deploy", msg)
 
 
@@ -57,6 +83,21 @@ def create_endpoint_config(
     data_capture_enabled: bool, data_capture_s3_uri: str | None,
     tags: list[dict],
 ) -> str:
+    # [FUNCTION DOC] Create a single-variant real-time endpoint config, reusing it if it already exists.
+    # Behavior: builds an "AllTraffic" production variant with the model, instance type, initial
+    #   count and weight 1.0, adding InferenceAmiVersion when given; if data capture is enabled,
+    #   requires an S3 URI and adds a capture config (sampling from DEFAULTS, input and output,
+    #   JSON content type). Calls create_endpoint_config; an "already existing" client error is
+    #   logged and treated as reuse, other client errors re-raised.
+    # Inputs (keyword-only after sm): sm - boto3 SageMaker client; config_name; model_name;
+    #   instance_type; initial_instance_count; inference_ami_version (or none);
+    #   data_capture_enabled; data_capture_s3_uri (or none); tags - tag list.
+    # Outputs: the config name.
+    # Exceptions: raises a value error if capture is enabled without a URI; swallows the
+    #   already-exists client error; re-raises others.
+    # Side effects: AWS API call; stderr logging.
+    # KNOWN ISSUE: a reused config is not checked against the requested instance type, AMI or
+    #   capture settings, so changed flags are silently ignored for an existing config name.
     log(f"Creating endpoint config: {config_name}")
 
     production_variant: dict[str, Any] = {
@@ -101,6 +142,13 @@ def create_endpoint_config(
 
 
 def create_endpoint(sm: Any, *, endpoint_name: str, config_name: str, tags: list[dict]) -> None:
+    # [FUNCTION DOC] Create the SageMaker endpoint from a config.
+    # Behavior: logs and calls create_endpoint with the name, config name and tags (no reuse
+    #   handling; does not wait).
+    # Inputs (keyword-only after sm): sm - boto3 SageMaker client; endpoint_name; config_name; tags.
+    # Outputs: none.
+    # Exceptions: client errors (including an already-existing endpoint) propagate.
+    # Side effects: AWS API call creating a billable endpoint; stderr logging.
     log(f"Creating endpoint: {endpoint_name}")
     sm.create_endpoint(
         EndpointName=endpoint_name,
@@ -113,6 +161,17 @@ def register_autoscaling(
     *, endpoint_name: str, variant_name: str, min_capacity: int, max_capacity: int,
     target_invocations: int, scale_in_cooldown: int, scale_out_cooldown: int, region: str,
 ) -> None:
+    # [FUNCTION DOC] Register target-tracking autoscaling on an endpoint variant.
+    # Behavior: creates an Application Auto Scaling client, registers the variant's desired instance
+    #   count as a scalable target with min/max capacity, then puts a policy named
+    #   "<endpoint>-target-tracking" tracking SageMakerVariantInvocationsPerInstance at the target
+    #   value with the given cooldowns.
+    # Inputs (keyword-only): endpoint_name; variant_name; min_capacity; max_capacity;
+    #   target_invocations (per instance per minute); scale_in_cooldown and scale_out_cooldown
+    #   (seconds); region.
+    # Outputs: none.
+    # Exceptions: client errors propagate.
+    # Side effects: AWS API calls; stderr logging.
     log(f"Registering autoscaling: min={min_capacity} max={max_capacity} target={target_invocations}/min")
     appscaling = boto3.client("application-autoscaling", region_name=region)
     resource_id = f"endpoint/{endpoint_name}/variant/{variant_name}"
@@ -142,6 +201,17 @@ def register_autoscaling(
 
 
 def create_alarms(*, endpoint_name: str, variant_name: str, sns_topic_arn: str | None, region: str) -> None:
+    # [FUNCTION DOC] Create the three standard CloudWatch alarms for an endpoint variant.
+    # Behavior: builds alarms "<endpoint>-ModelLatencyP99" (p99 ModelLatency above the latency
+    #   threshold converted ms to microseconds), "<endpoint>-Invocation5XXErrors" (sum above the
+    #   5xx count) and "<endpoint>-OverheadLatencyP99" (p99 OverheadLatency above the overhead
+    #   threshold in microseconds), each in AWS/SageMaker with endpoint and variant dimensions,
+    #   DEFAULTS period/evaluation periods, missing data not breaching, and the SNS topic as action
+    #   if given. Puts each alarm; warns if there is no topic.
+    # Inputs (keyword-only): endpoint_name; variant_name; sns_topic_arn (or none); region.
+    # Outputs: none.
+    # Exceptions: client errors propagate.
+    # Side effects: CloudWatch API calls creating/overwriting alarms; stderr logging.
     log(f"Creating CloudWatch alarms for {endpoint_name}")
     cw = boto3.client("cloudwatch", region_name=region)
     actions = [sns_topic_arn] if sns_topic_arn else []
@@ -202,6 +272,19 @@ def create_alarms(*, endpoint_name: str, variant_name: str, sns_topic_arn: str |
 
 
 def main() -> int:
+    # [FUNCTION DOC] Parse arguments and run the full real-time deployment; the script entry point.
+    # Behavior: 1) define and parse the CLI flags; 2) parse env pairs, compute endpoint name and
+    #   config name "<endpoint>-config"; 3) create STS and SageMaker clients, read caller ARN and
+    #   account id; 4) default the data-capture URI if capture is on without one; 5) build tags
+    #   (project defaults to model name); 6) create model, endpoint config and endpoint; wait for
+    #   InService; 7) register autoscaling unless disabled (warn otherwise); 8) create alarms unless
+    #   disabled; 9) log a summary with test and teardown commands and print the JSON summary.
+    # Inputs: none (reads the process command-line arguments).
+    # Outputs: returns 0; JSON on stdout; logs on stderr.
+    # Exceptions: none caught; AWS, validation, runtime and timeout errors propagate.
+    # Side effects: AWS API calls creating model, config, endpoint, scaling and alarms.
+    # KNOWN ISSUE: get_caller_identity is called twice where one call would do, and
+    #   --initial-instance-count is not checked against --min-capacity/--max-capacity.
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
     # Required

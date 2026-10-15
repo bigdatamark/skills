@@ -1,4 +1,36 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Script that merges a LoRA adapter into its base model, converts it to GGUF,
+# quantizes it and uploads the results plus a README to the Hugging Face Hub.
+# Behavior (all at import/top level, no main function): 1) check that git and make or cmake
+# exist, else exit 1; 2) read configuration from env vars; 3) load the base model in float16
+# with automatic device placement and remote code trusted, load the adapter on top, merge and
+# unload it, load the tokenizer from the adapter repo (exit 1 on any failure); 4) save merged
+# model and tokenizer to /tmp/merged_model; 5) clone llama.cpp into /tmp/llama.cpp (retry as a
+# shallow clone, exit 1 if both fail) and pip install its requirements plus sentencepiece and
+# protobuf (failures only warn); 6) run llama.cpp's HF-to-GGUF converter producing an f16 GGUF
+# in /tmp/gguf_output (exit 1 on failure); 7) configure and build llama-quantize with CMake
+# (CUDA off, 4 jobs; exit 1 on failure); 8) quantize to Q4_K_M, Q5_K_M and Q8_0, skipping
+# failures and printing sizes in MB, exit 1 if none succeed; 9) create the output repo (errors
+# only reported), upload the f16 file (exit 1 on failure) and each quantized file (failures
+# skipped); 10) upload a generated README model card (failure only reported); 11) print a
+# summary with download and Ollama usage instructions.
+# CLI arguments: none.
+# Env vars: ADAPTER_MODEL (default "evalstate/qwen-capybara-medium"), BASE_MODEL (default
+# "Qwen/Qwen2.5-0.5B"), OUTPUT_REPO (default "evalstate/qwen-capybara-medium-gguf"),
+# HF_USERNAME (default: owner part of ADAPTER_MODEL, used in the README citation); Hub auth is
+# taken implicitly by the Hub client (e.g. HF_TOKEN).
+# Constants/globals: merged_dir, gguf_output_dir, convert_script, quantize_bin paths under
+# /tmp; quant_formats list of (type, description) pairs; model_name is the last path part of
+# ADAPTER_MODEL; output files are named "<model_name>-f16.gguf" and
+# "<model_name>-<quant lowercase>.gguf".
+# Side effects: heavy filesystem writes under /tmp, network (Hub downloads/uploads, git
+# clone, pip), subprocesses (git, pip, python, cmake, llama-quantize), GPU/CPU memory use.
+# Exit codes: 0 on completion, 1 on the fatal failures listed above.
+# KNOWN ISSUE: if /tmp/llama.cpp already exists both clone attempts fail and the script exits.
+# KNOWN ISSUE: the README hard-codes SFT training, approximate file sizes and the year 2025,
+# and lists all quantizations even if some were skipped.
+# KNOWN ISSUE: the model is loaded with a "dtype" keyword, which older transformers versions
+# allowed by the declared dependency range (4.36+) do not accept (they expect torch_dtype).
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -48,6 +80,16 @@ import subprocess
 
 
 def check_system_dependencies():
+    # [FUNCTION DOC] HELPER: Verify that git and at least one of make or cmake are installed.
+    # Behavior: runs "which git"; if missing prints install hints and returns false. Then runs
+    # "which make" and "which cmake"; if neither is found prints hints and returns false.
+    # Otherwise prints a success line and returns true.
+    # Inputs: none.
+    # Outputs: boolean - true if dependencies are present; progress/hints printed to stdout.
+    # Exceptions: none caught; a missing "which" binary would raise a file-not-found error.
+    # Side effects: spawns "which" subprocesses; prints to stdout.
+    # KNOWN ISSUE: passes with only make available, but the script later requires cmake to build
+    # the quantize tool.
     """Check if required system packages are available."""
     print("🔍 Checking system dependencies...")
     
@@ -75,6 +117,16 @@ def check_system_dependencies():
 
 
 def run_command(cmd, description):
+    # [FUNCTION DOC] HELPER: Run an external command, print a short report and return success.
+    # Behavior: prints the description, runs the command capturing text output with check
+    # enabled; on success prints the first 200 chars of stdout (if any) and returns true. On a
+    # non-zero exit prints the command and the first 500 chars of stdout/stderr and returns false;
+    # if the executable is not found prints that and returns false.
+    # Inputs: cmd (list of strings, program and arguments); description (string shown to user).
+    # Outputs: boolean success flag; messages printed to stdout.
+    # Exceptions: catches subprocess non-zero-exit errors and file-not-found errors (swallowed,
+    # reported as false); others propagate.
+    # Side effects: spawns a subprocess; prints to stdout.
     """Run a command with error handling."""
     print(f"   {description}...")
     try:

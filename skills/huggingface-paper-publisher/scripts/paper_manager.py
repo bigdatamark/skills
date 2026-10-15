@@ -1,4 +1,19 @@
 #!/usr/bin/env -S uv run
+# [MODULE DOC] CLI for publishing research papers on the Hugging Face Hub.
+# Behavior overview: checks/indexes arXiv papers on huggingface.co/papers, links papers into a
+#   repo README, renders research articles from local Markdown templates, fetches arXiv metadata
+#   and generates BibTeX citations.
+# CLI arguments: subcommands index/check (--arxiv-id required); link (--repo-id required,
+#   --repo-type model|dataset|space default model, --arxiv-id, --arxiv-ids comma list,
+#   --citation, --create-pr); create (--template, --title, --output required; --authors,
+#   --abstract); info (--arxiv-id, --format json|text default json); citation (--arxiv-id,
+#   --format bibtex|apa|mla default bibtex); search (--query).
+# Env vars: HF_TOKEN (also loaded from a .env file via load_dotenv); falls back to the cached
+#   Hub token.
+# Top-level executed code: imports third-party deps, printing a hint and exiting 1 if any is
+#   missing; loads .env into the environment; as a script runs main.
+# Side effects: network calls to huggingface.co and export.arxiv.org, Hub README commits, local
+#   file writes for created articles, stdout output.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -37,9 +52,20 @@ load_dotenv()
 
 
 class PaperManager:
+    # [CLASS DOC] Groups paper operations against the Hub and arXiv around one authenticated client.
+    # Behavior: holds the token and an HfApi client; class constants hold regexes for modern
+    #   (YYMM.NNNN[N][vN]) and legacy (category/YYMMNNN[vN]) arXiv ids; static helpers clean ids and
+    #   sanitize/escape untrusted text.
     """Manages paper publishing operations on Hugging Face Hub."""
 
     def __init__(self, hf_token: Optional[str] = None):
+        # [FUNCTION DOC] Resolve the Hub token and create the API client.
+        # Behavior: uses the given token, else HF_TOKEN, else the locally cached token; prints a warning
+        #   if none found; creates an HfApi with that token.
+        # Inputs: hf_token (optional string, default none).
+        # Outputs: none.
+        # Exceptions: none.
+        # Side effects: reads env/cached token, stdout warning.
         """Initialize Paper Manager with HF token."""
         self.token = hf_token or os.getenv("HF_TOKEN") or get_token()
         if not self.token:
@@ -47,6 +73,15 @@ class PaperManager:
         self.api = HfApi(token=self.token)
 
     def index_paper(self, arxiv_id: str) -> Dict[str, Any]:
+        # [FUNCTION DOC] Check whether a paper is indexed on HF Papers and advise how to index it.
+        # Behavior: cleans the id (error dict on invalid); GETs the HF paper page (10 s timeout); status
+        #   200 means already indexed; otherwise reports it is not indexed and tells the user to visit
+        #   the URL. It does not itself trigger indexing.
+        # Inputs: arxiv_id (string, may include prefixes/URLs).
+        # Outputs: mapping with status "exists" (+url), "not_indexed" (+url, action), or "error"
+        #   (+message); also prints messages.
+        # Exceptions: ValueError and request errors are caught and turned into error results.
+        # Side effects: network request, stdout.
         """
         Index a paper on Hugging Face from arXiv.
 
@@ -82,6 +117,13 @@ class PaperManager:
             return {"status": "error", "message": str(e)}
 
     def check_paper(self, arxiv_id: str) -> Dict[str, Any]:
+        # [FUNCTION DOC] Report whether a paper page exists on HF Papers.
+        # Behavior: cleans the id; GETs the paper page (10 s timeout); 200 returns exists true with HF
+        #   and arXiv URLs; other statuses return exists false with an index URL and message.
+        # Inputs: arxiv_id (string).
+        # Outputs: mapping with exists flag and either URLs/ids, a message, or an error string.
+        # Exceptions: invalid ids and request errors are caught and returned as error fields.
+        # Side effects: network request.
         """
         Check if a paper exists on Hugging Face.
 
@@ -124,6 +166,19 @@ class PaperManager:
         citation: Optional[str] = None,
         create_pr: bool = False
     ) -> Dict[str, Any]:
+        # [FUNCTION DOC] Add a paper reference section to a Hub repo's README and commit it.
+        # Behavior: cleans the id; downloads README.md of the repo; inserts the paper section via
+        #   _add_paper_to_readme; if create_pr is set, prints that PRs are unimplemented; uploads the new
+        #   README as a direct commit "Add paper reference: arXiv:<id>"; prints success with URLs.
+        # Inputs: repo_id (string); arxiv_id (string); repo_type (string, default "model");
+        #   citation (optional string); create_pr (bool, default false).
+        # Outputs: mapping with status "success" plus paper/repo URLs and id, or "error" with message.
+        # Exceptions: all exceptions (including invalid id, missing README, upload failures) are caught,
+        #   printed and returned as error results.
+        # Side effects: network download/upload, a commit to the remote repo, stdout.
+        # KNOWN ISSUE: create_pr is ignored; the change is always committed directly to the main branch.
+        # KNOWN ISSUE: if the paper is already referenced, the unchanged README is still uploaded and
+        #   success reported.
         """
         Link a paper to a model/dataset/space repository.
 
@@ -200,6 +255,18 @@ class PaperManager:
         arxiv_id: str,
         citation: Optional[str] = None
     ) -> str:
+        # [FUNCTION DOC] HELPER: Return README text with a marked "Paper" section inserted after the YAML.
+        # Behavior: if the content starts with a YAML front-matter block, returns it unchanged when the id
+        #   already appears anywhere; otherwise splits after the front matter. Without front matter,
+        #   prepends an empty front-matter block. Builds a section between paper-manager start/end HTML
+        #   comments with a "## Paper" heading, a sentence saying "This model" (if "model" appears in the
+        #   text) or "This work", arXiv and HF links, and an optional sanitized BibTeX citation block.
+        # Inputs: content (README text); arxiv_id (string); citation (optional string).
+        # Outputs: updated README text.
+        # Exceptions: none.
+        # Side effects: prints a message when already referenced.
+        # KNOWN ISSUE: the duplicate check only runs when front matter exists, so READMEs without it get
+        #   a duplicate section on repeated runs.
         """
         Add paper reference to README content.
 
@@ -260,6 +327,19 @@ class PaperManager:
         authors: Optional[str] = None,
         abstract: Optional[str] = None
     ) -> Dict[str, Any]:
+        # [FUNCTION DOC] Render a research article from a Markdown template to a file.
+        # Behavior: loads templates/<template>.md next to the scripts folder (error result if missing);
+        #   computes today's date and sanitized title/authors/abstract (defaults "Your Name" and
+        #   "Abstract to be written..."). If the template has front matter, replaces TITLE/AUTHORS
+        #   placeholders there with YAML-escaped values and DATE raw, and in the body replaces
+        #   TITLE/AUTHORS/ABSTRACT/DATE with sanitized values; otherwise replaces all placeholders with
+        #   sanitized values. Writes the result to the output path.
+        # Inputs: template (name); title (string); output (file path); authors (optional comma list);
+        #   abstract (optional string).
+        # Outputs: mapping with status "success", output and template, or status "error" with message.
+        # Exceptions: file write/read errors propagate.
+        # Side effects: reads template file, writes/overwrites output file, stdout.
+        # KNOWN ISSUE: an ABSTRACT placeholder inside front matter is not replaced.
         """
         Create a research article from template.
 
@@ -336,6 +416,19 @@ class PaperManager:
         }
 
     def get_arxiv_info(self, arxiv_id: str) -> Dict[str, Any]:
+        # [FUNCTION DOC] Fetch a paper's title, authors and abstract from the arXiv Atom API.
+        # Behavior: cleans the id; GETs the export.arxiv.org query (10 s timeout, raising on HTTP error);
+        #   extracts title, all name tags and summary with regexes; drops the first name; sanitizes
+        #   values; returns with arXiv abs and PDF URLs.
+        # Inputs: arxiv_id (string).
+        # Outputs: mapping with arxiv_id, title, authors list, abstract, arxiv_url, pdf_url; or with an
+        #   "error" string.
+        # Exceptions: all exceptions are caught and returned as the error field.
+        # Side effects: network request.
+        # KNOWN ISSUE: the first title tag in the Atom feed is the feed title ("arXiv Query: ..."), not the
+        #   paper title, so the returned title is wrong.
+        # KNOWN ISSUE: skipping the first name tag drops the paper's real first author, since the feed
+        #   has no feed-level author name.
         """
         Fetch paper information from arXiv API.
 
@@ -384,6 +477,20 @@ class PaperManager:
         arxiv_id: str,
         format: str = "bibtex"
     ) -> str:
+        # [FUNCTION DOC] Generate a citation string for an arXiv paper.
+        # Behavior: cleans the id and fetches arXiv info (error strings on failure). For "bibtex", builds
+        #   key "arxiv<id with dots as underscores>", joins authors with " and ", derives the year from
+        #   the first two digits of the id (below 50 means 20xx else 19xx), escapes braces in title and
+        #   authors, and formats an article entry. Other formats return a not-implemented message.
+        # Inputs: arxiv_id (string); format (string, default "bibtex").
+        # Outputs: citation text or an error/not-implemented message string.
+        # Exceptions: invalid ids are caught and returned as text; others propagate.
+        # Side effects: network request.
+        # KNOWN ISSUE: legacy ids such as category/YYMMNNN make the year parse fail with an uncaught
+        #   ValueError.
+        # KNOWN ISSUE: a missing title is stored as none (key present), so the "Untitled" default never
+        #   applies and brace escaping crashes; empty author lists likewise skip the "Unknown" default.
+        # KNOWN ISSUE: "apa" and "mla" are accepted by the CLI but not implemented.
         """
         Generate citation for a paper.
 
@@ -432,6 +539,13 @@ class PaperManager:
 
     @staticmethod
     def _clean_arxiv_id(arxiv_id: str) -> str:
+        # [FUNCTION DOC] HELPER: Normalize and validate an arXiv identifier.
+        # Behavior: trims whitespace, removes a leading "arxiv:" prefix (any case), removes an arxiv.org
+        #   abs/pdf URL prefix, removes ".pdf", then requires a modern or legacy id format.
+        # Inputs: arxiv_id (string).
+        # Outputs: cleaned id string.
+        # Exceptions: ValueError if the cleaned id is not a valid format.
+        # Side effects: none.
         """Clean, normalize, and validate arXiv ID.
 
         Raises:
@@ -455,6 +569,13 @@ class PaperManager:
 
     @staticmethod
     def _escape_yaml_value(value: str) -> str:
+        # [FUNCTION DOC] HELPER: Quote a string as a double-quoted YAML scalar.
+        # Behavior: escapes backslashes then double quotes, and wraps the result in double quotes.
+        # Inputs: value (string).
+        # Outputs: quoted string.
+        # Exceptions: none.
+        # Side effects: none.
+        # KNOWN ISSUE: newlines are not escaped, so multi-line values can still break the YAML layout.
         """Escape a string for safe use as a YAML scalar value.
 
         Wraps in double quotes and escapes internal quotes and backslashes
@@ -465,6 +586,14 @@ class PaperManager:
 
     @staticmethod
     def _sanitize_text(text: str) -> str:
+        # [FUNCTION DOC] HELPER: Clean untrusted text for safe inclusion in Markdown/YAML output.
+        # Behavior: removes control characters except tab, newline and carriage return; collapses runs
+        #   of non-newline whitespace to one space; limits blank lines to one; escapes triple backticks;
+        #   backslash-escapes "---" at line starts; trims.
+        # Inputs: text (string).
+        # Outputs: sanitized string.
+        # Exceptions: none.
+        # Side effects: none.
         """Sanitize untrusted text for safe inclusion in Markdown/YAML output.
 
         Normalizes whitespace, strips control characters, and neutralizes
@@ -483,6 +612,17 @@ class PaperManager:
 
 
 def main():
+    # [FUNCTION DOC] CLI entry point: parse arguments and run the chosen subcommand.
+    # Behavior: builds the parser with all subcommands; with no command prints help and exits 1.
+    #   Creates a PaperManager, then: index/check print JSON results; link gathers ids from
+    #   --arxiv-id and --arxiv-ids (error and exit 1 if none) and links each, printing each result;
+    #   create renders an article and prints the JSON result; info prints JSON or a text summary;
+    #   citation prints the citation; search only prints a placeholder and an HF Papers search URL.
+    # Inputs: none (command-line arguments).
+    # Outputs: stdout text/JSON; exit code 1 on missing command or ids, else 0.
+    # Exceptions: none caught here beyond those handled by the manager methods.
+    # Side effects: network, Hub commits, file writes as per subcommand.
+    # KNOWN ISSUE: the search command is unimplemented and the query is not URL-encoded in the link.
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
         description="Paper Manager for Hugging Face Hub",

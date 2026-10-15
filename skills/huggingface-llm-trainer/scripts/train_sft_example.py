@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Example script: LoRA supervised fine-tuning of Qwen2.5-0.5B with TRL.
+# Behavior (top-level, no functions): loads trl-lib/Capybara (train split), splits 90/10 into
+# train/eval with seed 42, builds an SFT config (output dir "qwen-capybara-sft", push to Hub
+# repo "username/qwen-capybara-sft" on every save, 3 epochs, batch 4 with 4 accumulation
+# steps, LR 2e-5, logging every 10 steps, save and eval every 100 steps keeping 2, 10% warmup,
+# cosine schedule, Trackio reporting with placeholder project/run names) and a LoRA config
+# (rank 16, alpha 32, dropout 0.05, no bias, causal LM, targeting q_proj and v_proj), trains,
+# pushes to the Hub, finishes Trackio tracking and prints links.
+# CLI arguments: none. Env vars: Hub token (e.g. HF_TOKEN) is used implicitly for pushing.
+# Constants: hard-coded dataset, model and placeholder "username" repo IDs.
+# Outputs: progress prints; checkpoints in the output directory; adapter pushed to the Hub.
+# Side effects: network downloads/uploads, GPU training, filesystem writes, Trackio logging.
+# KNOWN ISSUE: "datasets" is imported but not declared in the inline script dependencies.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
