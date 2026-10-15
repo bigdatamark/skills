@@ -1,3 +1,21 @@
+# [MODULE DOC] Training script that fine-tunes any Transformers object detection model (DETR,
+# RT-DETR, D-FINE, YOLOS, ...) on a Hub dataset with the Trainer API.
+# Behavior: parses model/data/training arguments, logs in to the Hub, starts Trackio, loads the
+# dataset, auto-detects whether boxes are corner-based (xyxy) or COCO (x, y, width, height),
+# sanitizes and converts every split to clipped COCO boxes, adds image ids, shuffles and
+# optionally splits off validation, discovers category names (remapping string categories to
+# ids), truncates, loads config/model/image processor (resize longest side and pad to a square),
+# builds Albumentations augmentation pipelines, trains, evaluates mAP/mAR with torchmetrics, and
+# pushes to the Hub or writes a model card. Expects an "image" column and an "objects" column
+# holding "bbox" and "category" lists. The comment block after this one is PEP 723 inline script
+# metadata listing dependencies for "uv run".
+# CLI arguments: fields of the data and model argument classes plus all standard Trainer
+# training arguments; a single argument ending in ".json" is read as a JSON argument file.
+# Env vars: HF_TOKEN, or as a fallback "hfjob", supplies the Hub token.
+# Constants: logger - module logger.
+# Top-level executed code: checks Transformers is at least 4.57.0.dev0 and datasets at least
+# 2.0.0 (raising if not); runs main when executed as a script.
+# Side effects: network (Hub, Trackio), filesystem writes in the output directory and caches.
 # /// script
 # dependencies = [
 #     "transformers>=5.2.0",
@@ -57,6 +75,12 @@ require_version("datasets>=2.0.0", "To fix: pip install -r examples/pytorch/obje
 
 @dataclass
 class ModelOutput:
+    # [CLASS DOC] HELPER: Minimal container mimicking a model output for post-processing.
+    # Behavior: dataclass holding logits and predicted boxes so the image processor's detection
+    # post-processing can be called on evaluation arrays.
+    # Inputs: logits (tensor of class scores per query); pred_boxes (tensor of normalized
+    # center-format boxes per query).
+    # Outputs: none. Exceptions: none. Side effects: none.
     logits: torch.Tensor
     pred_boxes: torch.Tensor
 
@@ -64,6 +88,16 @@ class ModelOutput:
 def format_image_annotations_as_coco(
     image_id: str, categories: list[int], areas: list[float], bboxes: list[tuple[float]]
 ) -> dict:
+    # [FUNCTION DOC] HELPER: Package one image's annotations in the COCO detection layout.
+    # Behavior: zips categories, areas and boxes and builds one annotation mapping per object with
+    # image_id, category_id, iscrowd 0, area and bbox (as a list); wraps them with the image id.
+    # Inputs: image_id (identifier, typically an integer despite the string annotation); categories
+    # (list of integer class ids); areas (list of floats); bboxes (list of 4-number boxes in COCO
+    # x_min, y_min, width, height absolute pixels).
+    # Outputs: a mapping with "image_id" and "annotations" (list of annotation mappings).
+    # Exceptions: none. Side effects: none.
+    # KNOWN ISSUE: the docstring says the boxes are center_x, center_y, width, height, but callers
+    # pass Albumentations "coco" output, which is top-left x, y, width, height.
     """Format one set of image annotations to the COCO format
 
     Args:
@@ -97,6 +131,17 @@ def format_image_annotations_as_coco(
 
 
 def detect_bbox_format_from_samples(dataset, image_col="image", objects_col="objects", num_samples=50):
+    # [FUNCTION DOC] Detect whether a dataset's boxes are xyxy or xywh by checking image bounds.
+    # Behavior: inspects up to num_samples examples. For each 4-value box a, b, c, d: if c is less
+    # than a or d less than b it immediately returns "xywh". Otherwise counts how often the xywh
+    # reading (a+c, b+d) and the xyxy reading (c, d) exceed the image width/height by more than 5
+    # percent. Returns "xywh" when no boxes were seen; otherwise "xyxy" if the xywh reading overshoots
+    # more often, else "xywh", and logs the decision.
+    # Inputs: dataset (a Hugging Face dataset split); image_col (default "image", PIL images);
+    # objects_col (default "objects", mapping with a "bbox" list); num_samples (default 50).
+    # Outputs: the string "xyxy" or "xywh".
+    # Exceptions: none deliberately; missing columns raise key errors.
+    # Side effects: decodes sample images; writes a log line.
     """
     Detect whether bboxes are xyxy (Pascal VOC) or xywh (COCO) by checking
     bbox coordinates against image dimensions. The correct format interpretation
@@ -140,6 +185,15 @@ def detect_bbox_format_from_samples(dataset, image_col="image", objects_col="obj
 
 
 def sanitize_dataset(dataset, bbox_format="xywh", image_col="image", objects_col="objects"):
+    # [FUNCTION DOC] Clean, convert and clip all boxes of a dataset split to COCO format.
+    # Behavior: maps every example through a validator (see the nested helper) that keeps only valid
+    # boxes converted to clipped x, y, width, height, then filters out images with no remaining
+    # boxes. Logs a warning with the number of dropped images and an info line with the final count.
+    # Inputs: dataset (Hugging Face dataset split); bbox_format (default "xywh"; "xyxy" triggers
+    # conversion); image_col (default "image"); objects_col (default "objects").
+    # Outputs: the new, filtered dataset.
+    # Exceptions: none deliberately.
+    # Side effects: runs dataset map/filter (may write cache files); logs.
     """
     Validate bboxes, convert xyxy→xywh if needed, clip to image bounds, and remove
     entries with non-finite values, non-positive dimensions, or degenerate area (<1 px).
@@ -148,6 +202,19 @@ def sanitize_dataset(dataset, bbox_format="xywh", image_col="image", objects_col
     convert_xyxy = bbox_format == "xyxy"
 
     def _validate(example):
+        # [FUNCTION DOC] HELPER: Validate and convert the boxes of one example.
+        # Behavior: for each box: skip unless it has 4 finite values; convert from corners to
+        # width/height when converting; skip non-positive width or height; clamp the origin to at
+        # least 0; skip if the origin lies outside the image; clip width/height to the image; skip
+        # boxes under 1 square pixel. Rebuilds the objects mapping, replacing "bbox" with converted
+        # boxes and filtering every other list field of the original length to the kept indices;
+        # recomputes "area" from the boxes if it is missing or of the wrong length.
+        # Inputs: example (mapping with the image and objects columns).
+        # Outputs: the same example with its objects column replaced.
+        # Exceptions: none deliberately; non-numeric values would raise.
+        # Side effects: mutates and returns the example mapping.
+        # KNOWN ISSUE: existing "area" values are kept for surviving boxes even after clipping
+        # changed their size, so areas may no longer match the boxes.
         img_w, img_h = example[image_col].size
         objects = example[objects_col]
         bboxes = objects["bbox"]
@@ -211,6 +278,12 @@ def sanitize_dataset(dataset, bbox_format="xywh", image_col="image", objects_col
 
 
 def convert_bbox_yolo_to_pascal(boxes: torch.Tensor, image_size: tuple[int, int]) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Convert normalized center-format boxes to absolute corner boxes.
+    # Behavior: converts center x/y, width, height to corner coordinates, then scales by image width
+    # and height (accepting the size as a tensor, array or pair).
+    # Inputs: boxes (tensor of shape N by 4, values in 0..1); image_size (height, width).
+    # Outputs: tensor of shape N by 4 with x_min, y_min, x_max, y_max in pixels.
+    # Exceptions: none deliberately. Side effects: none.
     """
     Convert bounding boxes from YOLO format (x_center, y_center, width, height) in range [0, 1]
     to Pascal VOC format (x_min, y_min, x_max, y_max) in absolute coordinates.
@@ -242,6 +315,18 @@ def augment_and_transform_batch(
     image_processor: AutoImageProcessor,
     return_pixel_mask: bool = False,
 ) -> BatchFeature:
+    # [FUNCTION DOC] HELPER: Augment a batch and run the image processor to produce model inputs.
+    # Behavior: for each example (image ids from "image_id" or batch positions) converts the image to
+    # an RGB array, drops boxes that are not 4 values with positive size and non-negative origin,
+    # applies the Albumentations transform with boxes and categories, recomputes areas from the
+    # augmented boxes, and formats COCO annotations. Then calls the image processor on all images and
+    # annotations (resize, rescale, normalize, pad, convert boxes) returning tensors, and removes the
+    # pixel mask unless requested.
+    # Inputs: examples (batch mapping with "image", "objects" holding bbox/category/area, optional
+    # "image_id"); transform (Albumentations compose with COCO bbox params); image_processor;
+    # return_pixel_mask (bool, default false).
+    # Outputs: a batch feature with "pixel_values", "labels" and optionally "pixel_mask".
+    # Exceptions: none deliberately. Side effects: none.
     """Apply augmentations and format annotations in COCO format for object detection task"""
 
     images = []
@@ -285,6 +370,12 @@ def augment_and_transform_batch(
 
 
 def collate_fn(batch: list[BatchFeature]) -> Mapping[str, torch.Tensor | list[Any]]:
+    # [FUNCTION DOC] HELPER: Collate processed examples into a training batch.
+    # Behavior: stacks pixel values (and pixel masks if present) into tensors and keeps labels as a
+    # list of per-image target mappings.
+    # Inputs: batch (list of per-example batch features).
+    # Outputs: a mapping with "pixel_values", "labels" and optionally "pixel_mask".
+    # Exceptions: none deliberately. Side effects: none.
     data = {}
     data["pixel_values"] = torch.stack([x["pixel_values"] for x in batch])
     data["labels"] = [x["labels"] for x in batch]
@@ -300,6 +391,20 @@ def compute_metrics(
     threshold: float = 0.0,
     id2label: Mapping[int, str] | None = None,
 ) -> Mapping[str, float]:
+    # [FUNCTION DOC] Compute COCO-style mAP/mAR (overall and per class) for evaluation.
+    # Behavior: runs without gradient tracking. For each target batch records original image sizes
+    # and converts target boxes from normalized center format to absolute corners with their class
+    # labels. For each prediction batch takes elements 1 and 2 (logits and predicted boxes; element 0
+    # is assumed to be the loss output), wraps them as a model output and post-processes them with
+    # the image processor at the given score threshold and original sizes. Feeds predictions and
+    # targets to torchmetrics mean average precision (corner boxes, per-class metrics), replaces the
+    # per-class lists with "map_<class>" and "mar_100_<class>" entries (handling single-class scalar
+    # results), and rounds all values to 4 decimals.
+    # Inputs: evaluation_results (evaluation prediction with predictions and label_ids);
+    # image_processor (provides detection post-processing); threshold (float, default 0.0);
+    # id2label (mapping from class id to name, default none, ids used as names when absent).
+    # Outputs: a mapping from metric name to float.
+    # Exceptions: none deliberately. Side effects: none.
     """
     Compute mean average mAP, mAR and their variants for the object detection task.
 
@@ -372,6 +477,13 @@ def compute_metrics(
 
 @dataclass
 class DataTrainingArguments:
+    # [CLASS DOC] Dataclass of data-related command-line arguments for the detection script.
+    # Behavior: plain field container parsed by the Hugging Face argument parser.
+    # Inputs: dataset_name (default "cppe-5"); dataset_config_name (default none); train_val_split
+    # (default 0.15); image_square_size (default 600, longest side and padded square size);
+    # max_train_samples and max_eval_samples (default none); use_fast (default true, fast processor).
+    # Outputs: none. Exceptions: none. Side effects: none.
+    # KNOWN ISSUE: dataset_config_name is accepted but never passed to dataset loading.
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
     Using `HfArgumentParser` we can turn this class into argparse arguments to be able to specify
@@ -420,6 +532,12 @@ class DataTrainingArguments:
 
 @dataclass
 class ModelArguments:
+    # [CLASS DOC] Dataclass of model-related command-line arguments for the detection script.
+    # Behavior: plain field container parsed by the Hugging Face argument parser.
+    # Inputs: model_name_or_path (default "facebook/detr-resnet-50"); config_name and
+    # image_processor_name (default none); cache_dir (default none); model_revision (default "main");
+    # ignore_mismatched_sizes (default true); token (default none); trust_remote_code (default false).
+    # Outputs: none. Exceptions: none. Side effects: none.
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
     """
@@ -467,6 +585,35 @@ class ModelArguments:
 
 
 def main():
+    # [FUNCTION DOC] Entry point: run the full object detection fine-tuning pipeline.
+    # Behavior:
+    #   1. Parse arguments (JSON file if it is the only argument); log in with HF_TOKEN/"hfjob" and set
+    #      the hub token, or warn if pushing without a token; start Trackio; configure logging.
+    #   2. Load the dataset; detect the box format on train; sanitize every split; add sequential
+    #      "image_id" columns where missing; shuffle train; split off validation when none exists.
+    #   3. Category names come from the ClassLabel feature of objects.category; otherwise scan train:
+    #      integer categories give "class_0".."class_max", strings are sorted, mixed are text-sorted.
+    #      Build id/label mappings; if the first train example's categories are strings, remap every
+    #      split to integer ids. Apply max train/eval truncation.
+    #   4. Load config (with label mappings), model (mismatched sizes allowed) and image processor
+    #      configured to resize the longest side to the square size and pad to a square.
+    #   5. Training augmentations: occasional smallest-side resize plus box-safe crop, occasional blur,
+    #      perspective, horizontal flip, brightness/contrast and hue/saturation, with COCO boxes clipped
+    #      and tiny boxes dropped; validation uses a no-op. Attach lazy transforms to all splits.
+    #   6. Train with the custom collator and mAP metric (save model, metrics, state); evaluate on test
+    #      if present else validation; finish Trackio; push to Hub with tags or write a model card.
+    # Inputs: none directly (CLI arguments / JSON file and env vars).
+    # Outputs: model, processor, metrics, trainer state and model card in the output directory;
+    # optionally a Hub repository.
+    # Exceptions: errors from loading, training or pushing propagate; feature lookup failures while
+    # reading ClassLabel names are caught and trigger the dataset scan instead.
+    # Side effects: Hub login, network access, Trackio logging, global logging config, file writes.
+    # KNOWN ISSUE: the validation split is accessed unconditionally when attaching transforms, so a
+    # dataset without a validation split and with train_val_split set to 0 or none raises a key error.
+    # KNOWN ISSUE: max_eval_samples truncates only validation, yet final evaluation uses the test split
+    # when one exists.
+    # KNOWN ISSUE: the string-category remap is decided only from the first train example, and
+    # columns other than "image"/"objects" are not configurable.
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
 
@@ -575,6 +722,12 @@ def main():
         logger.info(f"Remapping string categories to integer IDs: {label2id}")
 
         def _remap_categories(example):
+            # [FUNCTION DOC] HELPER: Replace string category names of one example with integer ids.
+            # Behavior: maps each category in the example's objects through the label-to-id mapping.
+            # Inputs: example (mapping with an "objects" mapping holding a "category" list).
+            # Outputs: the example with integer categories.
+            # Exceptions: a key error if a category name is not in the mapping.
+            # Side effects: mutates and returns the example.
             objects = example["objects"]
             objects["category"] = [label2id[c] for c in objects["category"]]
             example["objects"] = objects

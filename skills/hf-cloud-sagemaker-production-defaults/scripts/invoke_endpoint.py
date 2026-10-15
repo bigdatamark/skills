@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# [MODULE DOC] CLI script that invokes a SageMaker real-time endpoint via the aws CLI with a BOM-free body,
+# optionally targeting an inference component and retrying while a scaled-to-zero component wakes.
+# Behavior: resolves the region, loads the payload (inline or from a file decoded so any UTF-8
+#   BOM is dropped), re-serializes it if the content type is JSON, writes it to a temporary
+#   UTF-8 file, runs "aws sagemaker-runtime invoke-endpoint" writing the response to another
+#   temp file, retries every 30 seconds on no-capacity errors until the wait budget runs out,
+#   prints the response body, and always deletes both temp files.
+# CLI arguments: required --endpoint-name; exactly one of --payload or --payload-file; optional
+#   --region, --content-type (default application/json), --inference-component-name,
+#   --wait-for-capacity seconds (default 0 = fail immediately).
+# Env vars: AWS_REGION, then AWS_DEFAULT_REGION, when no --region; the aws subprocess inherits
+#   the shell's AWS configuration.
+# Constants: NO_CAPACITY_MARKERS - substrings of the aws error text that mean "no capacity".
+# Top-level executed code: the main-guard that runs main and exits with its return code.
+# Outputs: response body on stdout; logs on stderr. Exit codes: 0 success, 1 failure (no region,
+#   invalid JSON, invocation error), 2 aws CLI missing, argparse usage errors.
 """Invoke a real-time SageMaker endpoint with a JSON payload. Cross-platform.
 
 This is the BOM-safe way to test an endpoint. On Windows, writing a payload with
@@ -47,10 +63,22 @@ NO_CAPACITY_MARKERS = ("has no capacity", "NoCapacity")
 
 
 def log(msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Write an "[invoke]"-prefixed message to stderr.
+    # Behavior: prints the prefixed message to stderr and flushes.
+    # Inputs: msg - text.
+    # Outputs: none returned; one stderr line.
+    # Exceptions: none.
+    # Side effects: writes to stderr.
     print(f"[invoke] {msg}", file=sys.stderr, flush=True)
 
 
 def aws_bin() -> str:
+    # [FUNCTION DOC] HELPER: Resolve the aws CLI executable path or exit.
+    # Behavior: looks up "aws" on PATH; if absent logs an error and exits the process with code 2.
+    # Inputs: none.
+    # Outputs: the aws executable path.
+    # Exceptions: terminates via system exit (code 2) when not found.
+    # Side effects: PATH lookup; stderr logging; may exit the process.
     exe = shutil.which("aws")
     if not exe:
         log("ERROR: the 'aws' CLI was not found on PATH. Install AWS CLI v2.")
@@ -59,6 +87,13 @@ def aws_bin() -> str:
 
 
 def resolve_region(arg_region: str | None) -> str:
+    # [FUNCTION DOC] HELPER: Determine the AWS region to use.
+    # Behavior: returns the argument if non-empty; else the first non-empty of AWS_REGION and
+    #   AWS_DEFAULT_REGION; else the output of "aws configure get region" if it succeeds; else "".
+    # Inputs: arg_region - region from the command line, or none.
+    # Outputs: region string, possibly empty.
+    # Exceptions: none caught; aws_bin may exit the process.
+    # Side effects: reads environment variables; may spawn an aws subprocess.
     if arg_region:
         return arg_region
     for var in ("AWS_REGION", "AWS_DEFAULT_REGION"):
@@ -71,6 +106,16 @@ def resolve_region(arg_region: str | None) -> str:
 
 
 def load_payload(args: argparse.Namespace) -> str:
+    # [FUNCTION DOC] HELPER: Return the request body text, BOM-stripped and, for JSON, validated and re-serialized.
+    # Behavior: reads the payload file with BOM-tolerant UTF-8 decoding if one was given, else uses
+    #   the inline payload; if the content type contains "json", parses and re-serializes it
+    #   compactly (default JSON separators, non-ASCII escaped), exiting with code 1 on invalid JSON.
+    # Inputs: args - parsed arguments providing payload_file, payload and content_type.
+    # Outputs: the body text.
+    # Exceptions: catches JSON decode errors and exits (code 1); file errors propagate.
+    # Side effects: reads a file; may log and exit the process.
+    # KNOWN ISSUE: the payload file is opened without being explicitly closed (relies on garbage
+    #   collection), and an inline --payload that itself begins with a BOM is not stripped.
     """Return the raw payload text, BOM stripped. Validates JSON when applicable."""
     if args.payload_file:
         # utf-8-sig decodes and discards a leading BOM if the file has one.
@@ -89,6 +134,22 @@ def load_payload(args: argparse.Namespace) -> str:
 
 
 def main() -> int:
+    # [FUNCTION DOC] Invoke the endpoint and print the response; the script entry point.
+    # Behavior: 1) parse arguments; 2) resolve the region, return 1 if none; 3) load the body;
+    #   4) write it to a temp ".json" file and create an empty temp ".out" file; 5) build the
+    #   invoke-endpoint command (body passed as a binary file URL, optional component name, output
+    #   path last); 6) loop: run it; on success break; on an error containing a no-capacity marker
+    #   while the deadline (now plus wait seconds) has not passed, log (with a wake explanation on
+    #   the first attempt) and sleep 30 seconds; otherwise log the error, add a hint if it was a
+    #   no-capacity error, and return 1; 7) print the output file's text (BOM-tolerant) and return 0;
+    #   8) in all cases delete the temp files.
+    # Inputs: none (reads the process command-line arguments).
+    # Outputs: returns 0 or 1; response body on stdout; logs on stderr.
+    # Exceptions: none caught (the cleanup runs in a finally clause).
+    # Side effects: creates and deletes temp files; spawns aws subprocesses (endpoint invocations);
+    #   sleeps.
+    # KNOWN ISSUE: the response file is opened without explicit close, and binary (non-UTF-8)
+    #   responses would raise a decode error.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint-name", required=True)
     parser.add_argument("--region")

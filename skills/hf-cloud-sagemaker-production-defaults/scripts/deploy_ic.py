@@ -1,4 +1,27 @@
 #!/usr/bin/env python
+# [MODULE DOC] CLI script that deploys a real-time SageMaker endpoint able to scale to zero instances,
+# using an inference component (IC) to carry the model, via boto3.
+# Behavior: parses flags, creates (or reuses) the model, creates an endpoint config with managed
+#   instance scaling (min instances default 0), creates the empty endpoint and waits for it,
+#   creates the inference component with one copy and waits for it (scanning its CloudWatch
+#   logs for crash-loop markers), registers copy-count target tracking on per-copy concurrency
+#   plus a wake-from-zero step policy, creates a wake alarm (driving the step policy) and a 5xx
+#   alarm, logs a summary and prints a JSON summary.
+# CLI arguments: required --model-name, --image-uri, --role-arn, --instance-type, --region;
+#   optional --model-s3-uri, repeatable --env KEY=VALUE, --inference-ami-version,
+#   --endpoint-name, --inference-component-name (default "<model-name>-ic"), --project,
+#   --environment, --initial-instance-count, --min-instance-count, --max-instance-count,
+#   --min-copy-count, --max-copy-count, --concurrency-target-per-copy, --accelerator-devices,
+#   --min-memory-mb, --sns-alarm-topic, --no-alarms, --no-autoscaling.
+# Env vars: none read directly; boto3 uses the standard AWS credential chain.
+# Constants: DEFAULTS - capacities, copy counts, concurrency target, cooldowns, wake step,
+#   download/startup timeouts, memory and accelerator reservations, alarm settings, env tag;
+#   IC_DIMENSION - scalable dimension for copy count; CONCURRENCY_METRIC - predefined
+#   high-resolution concurrency-per-copy metric; WAKE_METRIC - NoCapacityInvocationFailures;
+#   CRASH_MARKERS - log substrings taken as evidence of a crash-looping container.
+# Top-level executed code: imports helpers from the sibling _common module; main-guard runs main.
+# Outputs: progress on stderr; one JSON line on stdout (names, step policy ARN or null, region,
+#   instance type, scales-to-zero flag); exit 0 on success, else uncaught exceptions.
 """Create a real-time SageMaker endpoint that scales to ZERO instances.
 
 Real-time scale-to-zero requires inference components. The endpoint hosts no
@@ -97,6 +120,12 @@ CRASH_MARKERS = (
 
 
 def log(msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Log a message to stderr with the "deploy_ic" prefix.
+    # Behavior: delegates to the shared logger.
+    # Inputs: msg - text.
+    # Outputs: none returned; one stderr line.
+    # Exceptions: none.
+    # Side effects: writes to stderr.
     _log("deploy_ic", msg)
 
 
@@ -105,6 +134,19 @@ def create_endpoint_config(
     initial_instance_count: int, min_instance_count: int, max_instance_count: int,
     inference_ami_version: str | None, tags: list[dict],
 ) -> str:
+    # [FUNCTION DOC] Create an inference-component endpoint config, reusing it if it already exists.
+    # Behavior: builds an "AllTraffic" variant without a model: instance type, initial count,
+    #   download and startup health-check timeouts from DEFAULTS, managed instance scaling enabled
+    #   with the given min/max instance counts, least-outstanding-requests routing, and optional
+    #   InferenceAmiVersion. Calls create_endpoint_config with the execution role at config level.
+    #   An "already existing" client error is logged as reuse; others re-raise.
+    # Inputs (keyword-only after sm): sm - boto3 SageMaker client; config_name; instance_type;
+    #   role_arn; initial_instance_count; min_instance_count; max_instance_count;
+    #   inference_ami_version (or none); tags.
+    # Outputs: the config name.
+    # Exceptions: swallows the already-exists client error; re-raises others.
+    # Side effects: AWS API call; stderr logging.
+    # KNOWN ISSUE: a reused config is not compared to the requested settings.
     log(f"Creating IC endpoint config: {config_name}")
 
     variant: dict[str, Any] = {
@@ -146,6 +188,12 @@ def create_endpoint_config(
 
 
 def create_endpoint(sm: Any, *, endpoint_name: str, config_name: str, tags: list[dict]) -> None:
+    # [FUNCTION DOC] Create the SageMaker endpoint from a config.
+    # Behavior: logs and calls create_endpoint with name, config and tags; no wait, no reuse.
+    # Inputs (keyword-only after sm): sm - boto3 SageMaker client; endpoint_name; config_name; tags.
+    # Outputs: none.
+    # Exceptions: client errors propagate.
+    # Side effects: AWS API call creating a billable endpoint; stderr logging.
     log(f"Creating endpoint: {endpoint_name}")
     sm.create_endpoint(
         EndpointName=endpoint_name,
@@ -158,6 +206,15 @@ def create_inference_component(
     sm: Any, *, ic_name: str, endpoint_name: str, model_name: str,
     accelerator_devices: int, min_memory_mb: int, tags: list[dict],
 ) -> None:
+    # [FUNCTION DOC] Create an inference component hosting the model on the endpoint's variant.
+    # Behavior: calls create_inference_component on variant "AllTraffic" with the model name,
+    #   startup parameters (download and health-check timeouts from DEFAULTS), compute requirements
+    #   (minimum memory in MB and accelerator count) and an initial copy count of 1.
+    # Inputs (keyword-only after sm): sm - boto3 SageMaker client; ic_name; endpoint_name;
+    #   model_name; accelerator_devices; min_memory_mb; tags.
+    # Outputs: none.
+    # Exceptions: client errors (including an already-existing component) propagate.
+    # Side effects: AWS API call; stderr logging.
     log(f"Creating inference component: {ic_name}")
     sm.create_inference_component(
         InferenceComponentName=ic_name,
@@ -180,6 +237,15 @@ def create_inference_component(
 
 
 def scan_component_logs(ic_name: str, region: str, limit: int = 200) -> list[str]:
+    # [FUNCTION DOC] HELPER: Return crash-marker log lines from a component's newest CloudWatch log stream.
+    # Behavior: in log group "/aws/sagemaker/InferenceComponents/<ic_name>", finds the stream with
+    #   the latest event; fetches up to the limit of its most recent events; returns each message
+    #   containing any CRASH_MARKERS substring, trimmed and cut to 500 characters, in event order.
+    #   Returns an empty list if the group/stream is missing or cannot be read.
+    # Inputs: ic_name - component name; region; limit - max events to read (default 200).
+    # Outputs: list of matching log lines (possibly empty).
+    # Exceptions: catches client errors from both log calls and returns an empty list.
+    # Side effects: CloudWatch Logs API calls.
     """Return crash-marker lines from the component's newest log stream.
 
     Returns [] when the log group does not exist yet, or when the caller cannot
@@ -212,6 +278,18 @@ def scan_component_logs(ic_name: str, region: str, limit: int = 200) -> list[str
 
 
 def wait_for_component(sm: Any, ic_name: str, region: str, timeout_minutes: int = 30) -> None:
+    # [FUNCTION DOC] Poll an inference component until InService, failing fast on a crash loop.
+    # Behavior: until the deadline: describe the component; return on InService; raise on Failed
+    #   with its reason; otherwise count the poll, log status/elapsed, and from the second
+    #   non-terminal poll onward scan the logs - if crash markers are found, log the last six and
+    #   raise; sleep 30 seconds. Raise a timeout error after the deadline.
+    # Inputs: sm - boto3 SageMaker client; ic_name; region; timeout_minutes (default 30).
+    # Outputs: none.
+    # Exceptions: raises a runtime error on Failed status or crash evidence, and a timeout error;
+    #   client errors from describe propagate.
+    # Side effects: SageMaker and CloudWatch Logs API calls; sleeps; stderr logging.
+    # KNOWN ISSUE: markers are matched in the newest stream regardless of age, so stale crash lines
+    #   from an earlier deployment reusing the same component name could cause a false failure.
     """Poll DescribeInferenceComponent until InService.
 
     Also scans the container log on every poll. A crash loop never changes the
@@ -258,6 +336,15 @@ def register_autoscaling(
     *, ic_name: str, min_copies: int, max_copies: int, concurrency_target: int,
     region: str,
 ) -> str:
+    # [FUNCTION DOC] Register copy-count autoscaling and the wake-from-zero step policy for a component.
+    # Behavior: registers "inference-component/<ic_name>" with IC_DIMENSION and min/max copies;
+    #   puts "<ic>-concurrency-target-tracking" on CONCURRENCY_METRIC at the target with DEFAULTS
+    #   cooldowns; puts "<ic>-step-wake-from-zero", a step policy adding the wake step size for any
+    #   value at or above the alarm threshold with the wake cooldown; returns that policy's ARN.
+    # Inputs (keyword-only): ic_name; min_copies; max_copies; concurrency_target; region.
+    # Outputs: the step policy ARN.
+    # Exceptions: client errors propagate.
+    # Side effects: Application Auto Scaling API calls; stderr logging.
     """Register the scalable target and both policies. Returns the step ARN.
 
     Two policies, both required:
@@ -313,6 +400,16 @@ def create_alarms(
     *, ic_name: str, endpoint_name: str, step_policy_arn: str,
     sns_topic_arn: str | None, region: str,
 ) -> None:
+    # [FUNCTION DOC] Create the wake-from-zero alarm and the endpoint 5xx error alarm.
+    # Behavior: puts "<ic>-wake-from-zero" on WAKE_METRIC (component dimension, maximum, 30-second
+    #   period, one datapoint, at or above 1, missing data treated as missing) with the step policy
+    #   as its only action; puts "<endpoint>-Invocation5XXErrors" (sum over the DEFAULTS period
+    #   above the threshold, endpoint and AllTraffic dimensions) notifying the SNS topic if given;
+    #   warns if there is no topic.
+    # Inputs (keyword-only): ic_name; endpoint_name; step_policy_arn; sns_topic_arn (or none); region.
+    # Outputs: none.
+    # Exceptions: client errors propagate.
+    # Side effects: CloudWatch API calls; stderr logging.
     """Wake alarm (drives the step policy) plus an error alarm."""
     cw = boto3.client("cloudwatch", region_name=region)
 
@@ -358,6 +455,22 @@ def create_alarms(
 
 
 def main() -> int:
+    # [FUNCTION DOC] Parse arguments and run the full scale-to-zero deployment; the script entry point.
+    # Behavior: 1) define and parse flags; 2) parse env pairs; compute endpoint name, config name
+    #   and component name (override, or model name lowercased with hyphens plus "-ic", max 63
+    #   chars); 3) create clients and get the caller identity; note if min instances is nonzero;
+    #   4) build tags with the IC inference mode; 5) create model, config and endpoint, wait for
+    #   the endpoint; 6) create the component and wait for it; 7) unless disabled, register
+    #   autoscaling and keep the step ARN; 8) create alarms only if alarms are enabled and a step
+    #   ARN exists, else warn; 9) log a summary with test/teardown commands and print JSON.
+    # Inputs: none (reads the process command-line arguments).
+    # Outputs: returns 0; JSON on stdout; logs on stderr.
+    # Exceptions: none caught; AWS, runtime and timeout errors propagate.
+    # Side effects: AWS API calls creating model, config, endpoint, component, scaling, alarms.
+    # KNOWN ISSUE: the reported "scales_to_zero" flag only checks the min counts, so it is true even
+    #   with --no-autoscaling or --no-alarms, when nothing would scale or wake the endpoint.
+    # KNOWN ISSUE: the 63-character truncation of the default component name may cut off the "-ic"
+    #   suffix, and the override name is not validated.
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
     # Required

@@ -1,4 +1,11 @@
 #!/usr/bin/env -S uv run
+# [MODULE DOC] Unit tests for build_skill_distribution.py.
+# Behavior: loads the builder script as a module by file path and tests manifest contents,
+# hashing across chunk boundaries, and metadata validation, using temporary directories.
+# CLI arguments: none (runs unittest's main when executed). Env vars: none.
+# Constants: SCRIPT_PATH (sibling builder script); DIGEST_RE (valid "sha256:<64 hex>" digest).
+# Top-level code: imports the builder at import time into the global "builder" and registers it
+# in the module registry under "build_skill_distribution".
 # /// script
 # requires-python = ">=3.10"
 # dependencies = ["pyyaml==6.0.3"]
@@ -23,6 +30,12 @@ DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def load_builder() -> ModuleType:
+	# [FUNCTION DOC] HELPER: Import build_skill_distribution.py from its file path.
+	# Behavior: creates an import spec, registers the module in the module registry and executes it.
+	# Inputs: none.
+	# Outputs: the loaded module.
+	# Exceptions: RuntimeError if no spec/loader can be created; import errors propagate.
+	# Side effects: adds the module to the global module registry.
 	spec = importlib.util.spec_from_file_location("build_skill_distribution", SCRIPT_PATH)
 	if spec is None or spec.loader is None:
 		raise RuntimeError(f"could not load {SCRIPT_PATH}")
@@ -36,6 +49,13 @@ builder = load_builder()
 
 
 def write_skill(skill_dir: Path, description: str = "Test skill") -> None:
+	# [FUNCTION DOC] HELPER: Create a minimal skill directory with a SKILL.md fixture.
+	# Behavior: creates the directory (parents allowed, must not exist) and writes frontmatter with
+	# name equal to the directory name, the given description and license Apache-2.0, then a heading.
+	# Inputs: skill_dir; description - default "Test skill".
+	# Outputs: none.
+	# Exceptions: FileExistsError if the directory exists.
+	# Side effects: writes to the filesystem.
 	skill_dir.mkdir(parents=True)
 	(skill_dir / "SKILL.md").write_text(
 		f"---\nname: {skill_dir.name}\ndescription: {description}\nlicense: Apache-2.0\n---\n\n# Test\n",
@@ -44,7 +64,21 @@ def write_skill(skill_dir: Path, description: str = "Test skill") -> None:
 
 
 class BuildSkillDistributionTest(unittest.TestCase):
+	# [CLASS DOC] Test case covering the distribution builder.
+	# Behavior: groups end-to-end and unit tests; no fixtures beyond temporary directories.
 	def test_writes_complete_sep_2640_resource_manifests(self) -> None:
+		# [FUNCTION DOC] End-to-end check of skills.json resource manifests and legacy outputs.
+		# Behavior: builds a single-file skill and a multi-file skill (CRLF text, unicode, empty and binary
+		# files with a space in the name, plus ignored node_modules and .DS_Store), runs the builder, and
+		# asserts: exactly two entries keyed by name; each entry has only uri/frontmatter/resources with
+		# the expected SKILL.md URI and license; resources are unique, include SKILL.md and match the
+		# expected path set; each resource has only uri/digest/size, an integer size, a valid digest that
+		# matches the published bytes, which equal the source bytes; the binary file's digest is exact;
+		# ignored entries are not published; index.json has two skills; the multi archive exists; the
+		# manifest names skills.json as the catalog.
+		# Inputs: none. Outputs: none.
+		# Exceptions: assertion failures.
+		# Side effects: temporary directory I/O.
 		with tempfile.TemporaryDirectory() as temp_dir:
 			root = Path(temp_dir)
 			skills_dir = root / "skills"
@@ -126,6 +160,11 @@ class BuildSkillDistributionTest(unittest.TestCase):
 			self.assertEqual(manifest["artifacts"]["skills_catalog"], "skills.json")
 
 	def test_hash_and_size_across_chunk_boundaries(self) -> None:
+		# [FUNCTION DOC] Check hashing of a file larger than one read chunk.
+		# Behavior: writes slightly over 2 MiB of bytes and asserts the digest and size match a direct
+		# hash of the payload and its length.
+		# Inputs: none. Outputs: none.
+		# Exceptions: assertion failures. Side effects: temporary file I/O.
 		with tempfile.TemporaryDirectory() as temp_dir:
 			path = Path(temp_dir) / "large.bin"
 			payload = b"\x00\xff" * (1024 * 1024 + 1)
@@ -133,6 +172,11 @@ class BuildSkillDistributionTest(unittest.TestCase):
 			self.assertEqual(builder.sha256_and_size(path), (hashlib.sha256(payload).hexdigest(), len(payload)))
 
 	def test_rejects_non_string_metadata_values(self) -> None:
+		# [FUNCTION DOC] Check metadata validation.
+		# Behavior: writes a skill whose metadata maps a key to a list and asserts building raises
+		# ValueError with the "metadata must map string keys to string values" message.
+		# Inputs: none. Outputs: none.
+		# Exceptions: assertion failures. Side effects: temporary directory I/O.
 		with tempfile.TemporaryDirectory() as temp_dir:
 			root = Path(temp_dir)
 			skill_dir = root / "skills" / "invalid"
